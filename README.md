@@ -1,8 +1,13 @@
 # homelab-functions
 
-`homelab-functions` is a small local broker for common homelab actions.
+`homelab-functions` is a small local broker and helper package for common
+homelab actions.
 
-V1 exposes one function:
+Use the deployed HTTP service for common stable functions, especially notifying
+Joe. Use the client-side Home Assistant helper for service-specific discovery,
+state reads, event listeners, and direct service calls.
+
+## Notify Joe
 
 ```python
 import homelab
@@ -16,6 +21,31 @@ homelab.notify_joe(
 
 The helper calls the local `homelab-functions` HTTP service. Callers do not need
 Home Assistant credentials or WebSocket code.
+
+## Home Assistant Client Helper
+
+For services that need Home Assistant state or events, connect directly to Home
+Assistant with the shared helper instead of copying WebSocket boilerplate.
+
+```python
+import homelab
+
+async with homelab.HomeAssistantWebSocketClient.from_env() as ha:
+    states = await ha.get_states()
+    await ha.subscribe_events("state_changed")
+    await ha.call_service("switch", "turn_on", {"entity_id": "switch.example"})
+```
+
+The helper reads:
+
+```text
+HA_URL=https://example.ui.nabu.casa
+HA_LONG_LIVED_TOKEN=replace_me
+HA_REQUEST_TIMEOUT_SECONDS=30
+```
+
+Do not use the deployed `homelab-functions` server as a generic Home Assistant
+proxy. Add named server endpoints only for stable reusable actions.
 
 ## Service API
 
