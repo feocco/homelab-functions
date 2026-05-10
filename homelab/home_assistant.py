@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Small Home Assistant WebSocket helper for homelab services.
+
+This module is intentionally client-side only. Services that need Home Assistant
+state or events should connect directly with this helper instead of routing live
+event streams through the deployed homelab-functions HTTP server.
+"""
+
 import asyncio
 import itertools
 import os
@@ -14,17 +21,23 @@ EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class HomeAssistantError(RuntimeError):
+    """Raised when Home Assistant configuration, auth, or WebSocket calls fail."""
+
     pass
 
 
 @dataclass(frozen=True)
 class HomeAssistantConfig:
+    """Configuration for direct Home Assistant WebSocket access."""
+
     ha_url: str
     ha_long_lived_token: str
     request_timeout_seconds: float = 30
 
     @classmethod
     def from_env(cls) -> "HomeAssistantConfig":
+        """Build config from `HA_URL`, `HA_LONG_LIVED_TOKEN`, and optional timeout."""
+
         ha_url = os.environ.get("HA_URL")
         token = os.environ.get("HA_LONG_LIVED_TOKEN")
         missing = [
@@ -45,6 +58,24 @@ class HomeAssistantConfig:
 
 
 class HomeAssistantWebSocketClient:
+    """Direct Home Assistant WebSocket client for state, events, and service calls.
+
+    Typical usage:
+
+    ```python
+    import homelab
+
+    async with homelab.HomeAssistantWebSocketClient.from_env() as ha:
+        states = await ha.get_states()
+        await ha.subscribe_events("state_changed")
+        await ha.call_service("switch", "turn_on", {"entity_id": "switch.example"})
+    ```
+
+    Use this for app-specific discovery and long-running listeners. Use
+    `homelab.notify_joe(...)` instead when a service only needs to send Joe a
+    phone notification.
+    """
+
     def __init__(self, config: HomeAssistantConfig) -> None:
         self.config = config
         self._session: ClientSession | None = None
@@ -56,6 +87,8 @@ class HomeAssistantWebSocketClient:
 
     @classmethod
     def from_env(cls) -> "HomeAssistantWebSocketClient":
+        """Create a client from standard Home Assistant environment variables."""
+
         return cls(HomeAssistantConfig.from_env())
 
     async def __aenter__(self) -> "HomeAssistantWebSocketClient":
@@ -66,6 +99,8 @@ class HomeAssistantWebSocketClient:
         await self.close()
 
     async def connect(self) -> None:
+        """Open the WebSocket, authenticate, and start the background reader."""
+
         await self.close()
         timeout = ClientTimeout(total=self.config.request_timeout_seconds)
         self._session = ClientSession(timeout=timeout)
@@ -84,6 +119,8 @@ class HomeAssistantWebSocketClient:
         self._reader_task = asyncio.create_task(self._reader(), name="homelab-ha-websocket-reader")
 
     async def close(self) -> None:
+        """Close the WebSocket session and cancel the background reader."""
+
         if self._reader_task:
             self._reader_task.cancel()
             try:
@@ -99,14 +136,20 @@ class HomeAssistantWebSocketClient:
         self._session = None
 
     def add_event_handler(self, handler: EventHandler) -> None:
+        """Register an async callback for subscribed Home Assistant events."""
+
         self._event_handlers.append(handler)
 
     async def get_states(self) -> list[dict[str, Any]]:
+        """Return Home Assistant's current state list from `get_states`."""
+
         result = await self.request({"type": "get_states"})
         states = result.get("result")
         return states if isinstance(states, list) else []
 
     async def subscribe_events(self, event_type: str | None = None) -> None:
+        """Subscribe to Home Assistant events, optionally limited by event type."""
+
         payload: dict[str, Any] = {"type": "subscribe_events"}
         if event_type:
             payload["event_type"] = event_type
@@ -118,6 +161,8 @@ class HomeAssistantWebSocketClient:
         service: str,
         service_data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Call a Home Assistant service and return the raw result object."""
+
         result = await self.request(
             {
                 "type": "call_service",
@@ -130,6 +175,8 @@ class HomeAssistantWebSocketClient:
         return service_result if isinstance(service_result, dict) else {}
 
     async def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Send a raw Home Assistant WebSocket request and wait for its result."""
+
         if not self._ws or self._ws.closed:
             raise HomeAssistantError("Home Assistant WebSocket is not connected")
         message_id = next(self._ids)
@@ -179,6 +226,8 @@ class HomeAssistantWebSocketClient:
 
 
 def websocket_url(ha_url: str) -> str:
+    """Convert a Home Assistant base URL into its `/api/websocket` URL."""
+
     parsed = urlsplit(ha_url.rstrip("/"))
     if parsed.scheme == "https":
         scheme = "wss"

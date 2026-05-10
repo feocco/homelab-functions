@@ -44,6 +44,14 @@ HA_LONG_LIVED_TOKEN=replace_me
 HA_REQUEST_TIMEOUT_SECONDS=30
 ```
 
+The public helper methods have docstrings. From an interactive Python shell:
+
+```python
+import homelab
+
+help(homelab.HomeAssistantWebSocketClient)
+```
+
 Do not use the deployed `homelab-functions` server as a generic Home Assistant
 proxy. Add named server endpoints only for stable reusable actions.
 
