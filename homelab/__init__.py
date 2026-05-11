@@ -5,12 +5,14 @@ from homelab.home_assistant import (
     HomeAssistantWebSocketClient,
     websocket_url,
 )
+from homelab.notification_actions import NotificationActionRouter
 
 __all__ = [
     "HomeAssistantConfig",
     "HomeAssistantError",
     "HomeAssistantWebSocketClient",
     "HomelabFunctionsError",
+    "NotificationActionRouter",
     "notify_joe",
     "websocket_url",
 ]

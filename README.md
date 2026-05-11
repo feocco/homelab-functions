@@ -52,6 +52,31 @@ import homelab
 help(homelab.HomeAssistantWebSocketClient)
 ```
 
+## Actionable Notification Callbacks
+
+For services that send Home Assistant mobile notification buttons and need to
+handle the button press, use `NotificationActionRouter` with a direct
+`HomeAssistantWebSocketClient` subscription.
+
+```python
+import homelab
+
+router = homelab.NotificationActionRouter()
+router.register("MY_SERVICE_APPROVE", handle_approval)
+
+button = {
+    "title": "Approve",
+    "action": homelab.NotificationActionRouter.make_action("MY_SERVICE_APPROVE", token),
+}
+
+async def handle_ha_event(event: dict) -> None:
+    router.handle_event(event)
+```
+
+The deployed `homelab-functions` server should not become a generic action
+router. Each long-running service owns its own Home Assistant listener and
+business logic.
+
 Do not use the deployed `homelab-functions` server as a generic Home Assistant
 proxy. Add named server endpoints only for stable reusable actions.
 
