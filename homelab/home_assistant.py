@@ -135,6 +135,13 @@ class HomeAssistantWebSocketClient:
         self._ws = None
         self._session = None
 
+    async def wait_closed(self) -> None:
+        """Wait until the WebSocket reader exits or raises its failure."""
+
+        if self._reader_task is None:
+            raise HomeAssistantError("Home Assistant WebSocket reader is not running")
+        await self._reader_task
+
     def add_event_handler(self, handler: EventHandler) -> None:
         """Register an async callback for subscribed Home Assistant events."""
 

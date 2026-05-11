@@ -44,3 +44,15 @@ class HomeAssistantHelperTests(unittest.TestCase):
         self.assertEqual(config.ha_url, "https://example.ui.nabu.casa")
         self.assertEqual(config.ha_long_lived_token, "token")
         self.assertEqual(config.request_timeout_seconds, 12.5)
+
+    def test_websocket_client_exposes_wait_closed(self):
+        from homelab.home_assistant import HomeAssistantWebSocketClient
+
+        client = HomeAssistantWebSocketClient(
+            HomeAssistantConfig(
+                ha_url="https://example.ui.nabu.casa",
+                ha_long_lived_token="token",
+            )
+        )
+
+        self.assertTrue(callable(client.wait_closed))
