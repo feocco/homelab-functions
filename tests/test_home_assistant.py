@@ -2,7 +2,12 @@ import os
 import unittest
 from unittest.mock import patch
 
-from homelab.home_assistant import HomeAssistantConfig, HomeAssistantError, websocket_url
+from homelab.home_assistant import (
+    HomeAssistantConfig,
+    HomeAssistantError,
+    HomeAssistantWebSocketClient,
+    websocket_url,
+)
 
 
 class HomeAssistantHelperTests(unittest.TestCase):
@@ -46,8 +51,6 @@ class HomeAssistantHelperTests(unittest.TestCase):
         self.assertEqual(config.request_timeout_seconds, 12.5)
 
     def test_websocket_client_exposes_wait_closed(self):
-        from homelab.home_assistant import HomeAssistantWebSocketClient
-
         client = HomeAssistantWebSocketClient(
             HomeAssistantConfig(
                 ha_url="https://example.ui.nabu.casa",
@@ -56,3 +59,75 @@ class HomeAssistantHelperTests(unittest.TestCase):
         )
 
         self.assertTrue(callable(client.wait_closed))
+
+
+class FakeSession:
+    def __init__(self, websocket=None, error=None, **kwargs):
+        self.websocket = websocket
+        self.error = error
+        self.closed = False
+
+    async def ws_connect(self, url):
+        if self.error:
+            raise self.error
+        return self.websocket
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeWebSocket:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+        self.closed = False
+
+    async def receive_json(self):
+        return self.messages.pop(0)
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    async def close(self):
+        self.closed = True
+
+
+class HomeAssistantWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
+    def make_client(self):
+        return HomeAssistantWebSocketClient(
+            HomeAssistantConfig(
+                ha_url="https://example.ui.nabu.casa",
+                ha_long_lived_token="token",
+            )
+        )
+
+    async def test_connect_closes_session_when_websocket_connect_fails(self):
+        session = FakeSession(error=RuntimeError("connect failed"))
+        client = self.make_client()
+
+        with patch("homelab.home_assistant.ClientSession", return_value=session):
+            with self.assertRaisesRegex(RuntimeError, "connect failed"):
+                await client.connect()
+
+        self.assertTrue(session.closed)
+        self.assertIsNone(client._session)
+        self.assertIsNone(client._ws)
+
+    async def test_connect_closes_websocket_and_session_when_auth_fails(self):
+        websocket = FakeWebSocket(
+            [
+                {"type": "auth_required"},
+                {"type": "auth_invalid", "message": "bad token"},
+            ]
+        )
+        session = FakeSession(websocket=websocket)
+        client = self.make_client()
+
+        with patch("homelab.home_assistant.ClientSession", return_value=session):
+            with self.assertRaisesRegex(HomeAssistantError, "bad token"):
+                await client.connect()
+
+        self.assertTrue(websocket.closed)
+        self.assertTrue(session.closed)
+        self.assertIsNone(client._session)
+        self.assertIsNone(client._ws)

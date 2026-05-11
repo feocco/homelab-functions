@@ -104,19 +104,23 @@ class HomeAssistantWebSocketClient:
         await self.close()
         timeout = ClientTimeout(total=self.config.request_timeout_seconds)
         self._session = ClientSession(timeout=timeout)
-        self._ws = await self._session.ws_connect(websocket_url(self.config.ha_url))
+        try:
+            self._ws = await self._session.ws_connect(websocket_url(self.config.ha_url))
 
-        auth_required = await self._ws.receive_json()
-        if auth_required.get("type") != "auth_required":
-            raise HomeAssistantError(f"Unexpected Home Assistant auth handshake: {auth_required}")
+            auth_required = await self._ws.receive_json()
+            if auth_required.get("type") != "auth_required":
+                raise HomeAssistantError(f"Unexpected Home Assistant auth handshake: {auth_required}")
 
-        await self._ws.send_json({"type": "auth", "access_token": self.config.ha_long_lived_token})
-        auth_response = await self._ws.receive_json()
-        if auth_response.get("type") != "auth_ok":
-            message = auth_response.get("message") or auth_response.get("type") or "auth failed"
-            raise HomeAssistantError(f"Home Assistant auth failed: {message}")
+            await self._ws.send_json({"type": "auth", "access_token": self.config.ha_long_lived_token})
+            auth_response = await self._ws.receive_json()
+            if auth_response.get("type") != "auth_ok":
+                message = auth_response.get("message") or auth_response.get("type") or "auth failed"
+                raise HomeAssistantError(f"Home Assistant auth failed: {message}")
 
-        self._reader_task = asyncio.create_task(self._reader(), name="homelab-ha-websocket-reader")
+            self._reader_task = asyncio.create_task(self._reader(), name="homelab-ha-websocket-reader")
+        except BaseException:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         """Close the WebSocket session and cancel the background reader."""
