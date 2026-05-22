@@ -98,6 +98,8 @@ proxy. Add named server endpoints only for stable reusable actions.
 
 - `GET /health`
 - `POST /v1/notify/joe`
+- `GET /v1/notifications`
+- `POST /v1/notifications/actions`
 
 `POST /v1/notify/joe` requires:
 
@@ -127,6 +129,27 @@ Example request:
 }
 ```
 
+Successful notification sends are written to the shared notification ledger.
+Services that listen for their own `mobile_app_notification_action` events can
+record the response without turning `homelab-functions` into a generic action
+router:
+
+```python
+homelab.record_notification_action(
+    "PLANT_REPLY::token",
+    tag="plant-monitor-ficus",
+    group="plant-monitor",
+    reply_text="Watered today",
+    event=home_assistant_event_data,
+)
+```
+
+The recent ledger can be inspected with:
+
+```python
+homelab.list_notifications(group="plant-monitor", limit=20)
+```
+
 ## Configuration
 
 Server runtime environment:
@@ -141,6 +164,7 @@ SERVICE_PORT=8091
 TZ=America/New_York
 LOG_LEVEL=INFO
 REQUEST_TIMEOUT_SECONDS=10
+NOTIFICATION_LEDGER_PATH=/app/data/notifications.sqlite3
 ```
 
 Client helper environment:

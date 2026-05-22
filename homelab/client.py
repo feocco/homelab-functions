@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -59,6 +60,58 @@ def notify_joe(
     )
 
 
+def record_notification_action(
+    action: str,
+    *,
+    tag: str | None = None,
+    group: str | None = None,
+    reply_text: str | None = None,
+    event: dict[str, Any] | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"action": action}
+    if tag is not None:
+        payload["tag"] = tag
+    if group is not None:
+        payload["group"] = group
+    if reply_text is not None:
+        payload["reply_text"] = reply_text
+    if event is not None:
+        payload["event"] = event
+
+    return _post_json(
+        "/v1/notifications/actions",
+        payload,
+        service_url=service_url,
+        token=token,
+        timeout=timeout,
+    )
+
+
+def list_notifications(
+    *,
+    group: str | None = None,
+    tag: str | None = None,
+    limit: int = 50,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    query: dict[str, str] = {"limit": str(limit)}
+    if group is not None:
+        query["group"] = group
+    if tag is not None:
+        query["tag"] = tag
+    return _get_json(
+        f"/v1/notifications?{urlencode(query)}",
+        service_url=service_url,
+        token=token,
+        timeout=timeout,
+    )
+
+
 def _post_json(
     path: str,
     payload: dict[str, Any],
@@ -85,6 +138,54 @@ def _post_json(
             "Accept": "application/json",
         },
         method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        error_payload = _parse_error_payload(body_text)
+        raise HomelabFunctionsError(
+            error_payload.get("message") or f"homelab-functions returned HTTP {exc.code}",
+            status=exc.code,
+            code=error_payload.get("code"),
+            detail=error_payload.get("detail"),
+        ) from exc
+    except URLError as exc:
+        raise HomelabFunctionsError(
+            f"Could not reach homelab-functions at {base_url}: {exc.reason}",
+            code="service_unreachable",
+        ) from exc
+    except TimeoutError as exc:
+        raise HomelabFunctionsError(
+            f"Timed out calling homelab-functions at {base_url}",
+            code="service_timeout",
+        ) from exc
+
+
+def _get_json(
+    path: str,
+    *,
+    service_url: str | None,
+    token: str | None,
+    timeout: float,
+) -> dict[str, Any]:
+    base_url = (service_url or os.environ.get("HOMELAB_FUNCTIONS_URL") or DEFAULT_FUNCTIONS_URL).rstrip("/")
+    auth_token = token if token is not None else os.environ.get("HOMELAB_FUNCTIONS_TOKEN")
+    if not auth_token:
+        raise HomelabFunctionsError(
+            "HOMELAB_FUNCTIONS_TOKEN is required to call homelab-functions",
+            code="missing_client_token",
+        )
+
+    request = Request(
+        f"{base_url}{path}",
+        headers={
+            "Authorization": f"Bearer {auth_token}",
+            "Accept": "application/json",
+        },
+        method="GET",
     )
 
     try:

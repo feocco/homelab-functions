@@ -12,6 +12,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+from .notification_ledger import NotificationLedger
+
 
 LOGGER = logging.getLogger("homelab-functions")
 MAX_BUTTONS = 3
@@ -50,6 +52,7 @@ class Config:
     service_port: int = 8091
     request_timeout_seconds: float = 10
     log_level: str = "INFO"
+    notification_ledger_path: str = "/app/data/notifications.sqlite3"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -72,6 +75,10 @@ class Config:
             service_port=int(os.environ.get("SERVICE_PORT", "8091")),
             request_timeout_seconds=float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10")),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
+            notification_ledger_path=os.environ.get(
+                "NOTIFICATION_LEDGER_PATH",
+                "/app/data/notifications.sqlite3",
+            ),
         )
 
 
@@ -293,14 +300,22 @@ def build_service_data(notification: dict[str, Any]) -> dict[str, Any]:
 
 CONFIG_KEY = web.AppKey("config", Config)
 HA_CLIENT_KEY = web.AppKey("ha_client", HomeAssistantClient)
+LEDGER_KEY = web.AppKey("notification_ledger", NotificationLedger)
 
 
-def create_app(config: Config, ha_client: HomeAssistantClient | None = None) -> web.Application:
+def create_app(
+    config: Config,
+    ha_client: HomeAssistantClient | None = None,
+    ledger: NotificationLedger | None = None,
+) -> web.Application:
     app = web.Application()
     app[CONFIG_KEY] = config
     app[HA_CLIENT_KEY] = ha_client or HomeAssistantClient(config)
+    app[LEDGER_KEY] = ledger or NotificationLedger(config.notification_ledger_path)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/notify/joe", notify_joe)
+    app.router.add_get("/v1/notifications", list_notifications)
+    app.router.add_post("/v1/notifications/actions", record_notification_action)
     return app
 
 
@@ -313,6 +328,7 @@ async def health(request: web.Request) -> web.Response:
             "ha_url_configured": bool(config.ha_url),
             "ha_notify_joe_service_configured": bool(config.ha_notify_joe_service),
             "token_configured": bool(config.homelab_functions_token),
+            "notification_ledger_configured": bool(config.notification_ledger_path),
         }
     )
 
@@ -327,6 +343,11 @@ async def notify_joe(request: web.Request) -> web.Response:
         notification = validate_notification_payload(payload)
         service_data = build_service_data(notification)
         context_id = await request.app[HA_CLIENT_KEY].send_notification(service_data)
+        notification_record = request.app[LEDGER_KEY].record_sent(
+            notification,
+            service_data,
+            ha_context_id=context_id,
+        )
     except ValidationError as exc:
         return error_response(
             HTTPStatus.BAD_REQUEST,
@@ -353,8 +374,84 @@ async def notify_joe(request: web.Request) -> web.Response:
         {
             "status": "sent",
             "ha_context_id": context_id,
+            "notification_id": notification_record["id"],
         }
     )
+
+
+async def list_notifications(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    if not authorized(request, config.homelab_functions_token):
+        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
+
+    limit = parse_limit(request.query.get("limit"))
+    notifications = request.app[LEDGER_KEY].list_notifications(
+        limit=limit,
+        group=optional_query_string(request.query.get("group")),
+        tag=optional_query_string(request.query.get("tag")),
+    )
+    return web.json_response({"notifications": notifications})
+
+
+async def record_notification_action(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    if not authorized(request, config.homelab_functions_token):
+        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
+
+    try:
+        payload = await request.json()
+        action_event = validate_notification_action_payload(payload)
+    except ValidationError as exc:
+        return error_response(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            str(exc),
+            detail=exc.field,
+        )
+
+    result = request.app[LEDGER_KEY].record_action(action_event)
+    return web.json_response(result)
+
+
+def parse_limit(raw_limit: str | None) -> int:
+    if raw_limit is None or not raw_limit.strip():
+        return 50
+    try:
+        return int(raw_limit)
+    except ValueError:
+        raise web.HTTPBadRequest(
+            text='{"error":{"code":"invalid_request","message":"limit must be an integer","detail":"limit"}}',
+            content_type="application/json",
+        )
+
+
+def optional_query_string(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def validate_notification_action_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValidationError("Request body must be a JSON object")
+
+    action = required_string(payload, "action")
+    validated: dict[str, Any] = {"action": action}
+    for field in ("tag", "group", "reply_text"):
+        value = payload.get(field)
+        if value is not None:
+            if not isinstance(value, str) or not value.strip():
+                raise ValidationError(f"{field} must be a non-empty string", field=field)
+            validated[field] = value.strip()
+
+    event = payload.get("event")
+    if event is not None:
+        if not isinstance(event, dict):
+            raise ValidationError("event must be an object", field="event")
+        validated["event"] = event
+
+    return validated
 
 
 def authorized(request: web.Request, expected_token: str) -> bool:

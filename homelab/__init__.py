@@ -1,4 +1,9 @@
-from homelab.client import HomelabFunctionsError, notify_joe
+from homelab.client import (
+    HomelabFunctionsError,
+    list_notifications,
+    notify_joe,
+    record_notification_action,
+)
 from homelab.home_assistant import (
     HomeAssistantConfig,
     HomeAssistantError,
@@ -13,6 +18,8 @@ __all__ = [
     "HomeAssistantWebSocketClient",
     "HomelabFunctionsError",
     "NotificationActionRouter",
+    "list_notifications",
     "notify_joe",
+    "record_notification_action",
     "websocket_url",
 ]
