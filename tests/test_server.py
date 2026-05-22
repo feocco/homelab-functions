@@ -77,6 +77,36 @@ class ValidationTests(unittest.TestCase):
             },
         )
 
+    def test_builds_text_input_action_payload(self):
+        notification = validate_notification_payload(
+            {
+                "title": "Bedtime follow-up",
+                "message": "Why skipped?",
+                "buttons": [
+                    {
+                        "title": "Reply",
+                        "action": "BEDTIME_MISSED_REASON::token",
+                        "behavior": "textInput",
+                        "textInputButtonTitle": "Send",
+                        "textInputPlaceholder": "Why didn't you use it?",
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(
+            build_service_data(notification)["data"]["actions"],
+            [
+                {
+                    "title": "Reply",
+                    "action": "BEDTIME_MISSED_REASON::token",
+                    "behavior": "textInput",
+                    "textInputButtonTitle": "Send",
+                    "textInputPlaceholder": "Why didn't you use it?",
+                }
+            ],
+        )
+
     def test_splits_notify_service(self):
         self.assertEqual(
             split_ha_notify_service("notify.mobile_app_pixel"),

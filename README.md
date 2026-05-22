@@ -77,6 +77,20 @@ The deployed `homelab-functions` server should not become a generic action
 router. Each long-running service owns its own Home Assistant listener and
 business logic.
 
+Buttons that request a typed response can include Home Assistant text-input
+fields. The service that listens for the action reads `reply_text` from the
+`mobile_app_notification_action` event.
+
+```python
+button = {
+    "title": "Reply",
+    "action": homelab.NotificationActionRouter.make_action("MY_SERVICE_REPLY", token),
+    "behavior": "textInput",
+    "textInputButtonTitle": "Send",
+    "textInputPlaceholder": "Add a note",
+}
+```
+
 Do not use the deployed `homelab-functions` server as a generic Home Assistant
 proxy. Add named server endpoints only for stable reusable actions.
 
@@ -101,7 +115,14 @@ Example request:
   "group": "plant-monitor",
   "url": "/lovelace/plants",
   "buttons": [
-    {"title": "Open plants", "uri": "/lovelace/plants"}
+    {"title": "Open plants", "uri": "/lovelace/plants"},
+    {
+      "title": "Reply",
+      "action": "PLANT_REPLY::token",
+      "behavior": "textInput",
+      "textInputButtonTitle": "Send",
+      "textInputPlaceholder": "Add a note"
+    }
   ]
 }
 ```

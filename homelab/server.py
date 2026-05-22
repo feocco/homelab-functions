@@ -16,6 +16,14 @@ from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 LOGGER = logging.getLogger("homelab-functions")
 MAX_BUTTONS = 3
 ACTION_RE = re.compile(r"[^A-Za-z0-9_]+")
+ACTION_FIELDS = (
+    "action",
+    "title",
+    "uri",
+    "behavior",
+    "textInputButtonTitle",
+    "textInputPlaceholder",
+)
 
 
 class ConfigError(RuntimeError):
@@ -236,6 +244,13 @@ def validate_buttons(buttons: Any) -> list[dict[str, str]]:
                 raise ValidationError(f"buttons[{index}].uri must be a non-empty string", field="buttons")
             normalized["uri"] = uri.strip()
 
+        for field in ("behavior", "textInputButtonTitle", "textInputPlaceholder"):
+            value = button.get(field)
+            if value is not None:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValidationError(f"buttons[{index}].{field} must be a non-empty string", field="buttons")
+                normalized[field] = value.strip()
+
         validated.append(normalized)
 
     return validated
@@ -266,7 +281,7 @@ def build_service_data(notification: dict[str, Any]) -> dict[str, Any]:
     buttons = notification.get("buttons")
     if buttons:
         data["actions"] = [
-            {key: value for key, value in button.items() if key in ("action", "title", "uri")}
+            {key: value for key, value in button.items() if key in ACTION_FIELDS}
             for button in buttons
         ]
 
