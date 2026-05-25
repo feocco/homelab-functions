@@ -47,6 +47,7 @@ class Config:
     ha_url: str
     ha_long_lived_token: str
     ha_notify_joe_service: str
+    ha_notify_jess_service: str
     homelab_functions_token: str
     service_host: str = "0.0.0.0"
     service_port: int = 8091
@@ -60,6 +61,7 @@ class Config:
             "HA_URL": os.environ.get("HA_URL"),
             "HA_LONG_LIVED_TOKEN": os.environ.get("HA_LONG_LIVED_TOKEN"),
             "HA_NOTIFY_JOE_SERVICE": os.environ.get("HA_NOTIFY_JOE_SERVICE"),
+            "HA_NOTIFY_JESS_SERVICE": os.environ.get("HA_NOTIFY_JESS_SERVICE"),
             "HOMELAB_FUNCTIONS_TOKEN": os.environ.get("HOMELAB_FUNCTIONS_TOKEN"),
         }
         missing = [key for key, value in required.items() if not value]
@@ -70,6 +72,7 @@ class Config:
             ha_url=required["HA_URL"] or "",
             ha_long_lived_token=required["HA_LONG_LIVED_TOKEN"] or "",
             ha_notify_joe_service=required["HA_NOTIFY_JOE_SERVICE"] or "",
+            ha_notify_jess_service=required["HA_NOTIFY_JESS_SERVICE"] or "",
             homelab_functions_token=required["HOMELAB_FUNCTIONS_TOKEN"] or "",
             service_host=os.environ.get("SERVICE_HOST", "0.0.0.0"),
             service_port=int(os.environ.get("SERVICE_PORT", "8091")),
@@ -86,8 +89,8 @@ class HomeAssistantClient:
     def __init__(self, config: Config) -> None:
         self.config = config
 
-    async def send_notification(self, service_data: dict[str, Any]) -> str | None:
-        domain, service = split_ha_notify_service(self.config.ha_notify_joe_service)
+    async def send_notification(self, service_data: dict[str, Any], *, notify_service: str) -> str | None:
+        domain, service = split_ha_notify_service(notify_service)
         result = await self.call_service(domain, service, service_data)
         context = result.get("context") if isinstance(result, dict) else None
         context_id = context.get("id") if isinstance(context, dict) else None
@@ -314,6 +317,7 @@ def create_app(
     app[LEDGER_KEY] = ledger or NotificationLedger(config.notification_ledger_path)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/notify/joe", notify_joe)
+    app.router.add_post("/v1/notify/jess", notify_jess)
     app.router.add_get("/v1/notifications", list_notifications)
     app.router.add_post("/v1/notifications/actions", record_notification_action)
     return app
@@ -327,6 +331,7 @@ async def health(request: web.Request) -> web.Response:
             "service": "homelab-functions",
             "ha_url_configured": bool(config.ha_url),
             "ha_notify_joe_service_configured": bool(config.ha_notify_joe_service),
+            "ha_notify_jess_service_configured": bool(config.ha_notify_jess_service),
             "token_configured": bool(config.homelab_functions_token),
             "notification_ledger_configured": bool(config.notification_ledger_path),
         }
@@ -335,6 +340,16 @@ async def health(request: web.Request) -> web.Response:
 
 async def notify_joe(request: web.Request) -> web.Response:
     config = request.app[CONFIG_KEY]
+    return await notify_recipient(request, config.ha_notify_joe_service)
+
+
+async def notify_jess(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    return await notify_recipient(request, config.ha_notify_jess_service)
+
+
+async def notify_recipient(request: web.Request, notify_service: str) -> web.Response:
+    config = request.app[CONFIG_KEY]
     if not authorized(request, config.homelab_functions_token):
         return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
 
@@ -342,7 +357,10 @@ async def notify_joe(request: web.Request) -> web.Response:
         payload = await request.json()
         notification = validate_notification_payload(payload)
         service_data = build_service_data(notification)
-        context_id = await request.app[HA_CLIENT_KEY].send_notification(service_data)
+        context_id = await request.app[HA_CLIENT_KEY].send_notification(
+            service_data,
+            notify_service=notify_service,
+        )
         notification_record = request.app[LEDGER_KEY].record_sent(
             notification,
             service_data,

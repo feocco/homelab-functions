@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from homelab.client import HomelabFunctionsError, list_notifications, notify_joe, record_notification_action
+from homelab.client import HomelabFunctionsError, list_notifications, notify_jess, notify_joe, record_notification_action
 
 
 class FakeResponse:
@@ -46,6 +46,26 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(
             json.loads(request.data.decode("utf-8")),
             {"title": "Title", "message": "Body", "tag": "tag"},
+        )
+
+    @patch("homelab.client.urlopen")
+    def test_posts_notify_jess_request(self, urlopen):
+        urlopen.return_value = FakeResponse({"status": "sent", "ha_context_id": "ctx-jess"})
+
+        result = notify_jess(
+            "Dinner plan",
+            "Please review.",
+            group="mealie-planner",
+            service_url="http://homelab-functions:8080",
+            token="secret",
+        )
+
+        self.assertEqual(result, {"status": "sent", "ha_context_id": "ctx-jess"})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://homelab-functions:8080/v1/notify/jess")
+        self.assertEqual(
+            json.loads(request.data.decode("utf-8")),
+            {"title": "Dinner plan", "message": "Please review.", "group": "mealie-planner"},
         )
 
     @patch("homelab.client.urlopen")

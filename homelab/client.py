@@ -38,6 +38,59 @@ def notify_joe(
     token: str | None = None,
     timeout: float = 10,
 ) -> dict[str, Any]:
+    return _notify_person(
+        "joe",
+        title,
+        message,
+        tag=tag,
+        group=group,
+        url=url,
+        buttons=buttons,
+        service_url=service_url,
+        token=token,
+        timeout=timeout,
+    )
+
+
+def notify_jess(
+    title: str,
+    message: str,
+    *,
+    tag: str | None = None,
+    group: str | None = None,
+    url: str | None = None,
+    buttons: list[dict[str, Any]] | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    return _notify_person(
+        "jess",
+        title,
+        message,
+        tag=tag,
+        group=group,
+        url=url,
+        buttons=buttons,
+        service_url=service_url,
+        token=token,
+        timeout=timeout,
+    )
+
+
+def _notify_person(
+    recipient: str,
+    title: str,
+    message: str,
+    *,
+    tag: str | None,
+    group: str | None,
+    url: str | None,
+    buttons: list[dict[str, Any]] | None,
+    service_url: str | None,
+    token: str | None,
+    timeout: float,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "title": title,
         "message": message,
@@ -52,7 +105,7 @@ def notify_joe(
         payload["buttons"] = buttons
 
     return _post_json(
-        "/v1/notify/joe",
+        f"/v1/notify/{recipient}",
         payload,
         service_url=service_url,
         token=token,

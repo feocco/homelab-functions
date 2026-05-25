@@ -17,9 +17,11 @@ from homelab.server import (
 class FakeHomeAssistantClient:
     def __init__(self):
         self.service_data = None
+        self.notify_service = None
 
-    async def send_notification(self, service_data):
+    async def send_notification(self, service_data, *, notify_service):
         self.service_data = service_data
+        self.notify_service = notify_service
         return "context-123"
 
 
@@ -130,6 +132,7 @@ class AppTests(AioHTTPTestCase):
             ha_url="https://example.ui.nabu.casa",
             ha_long_lived_token="ha-token",
             ha_notify_joe_service="notify.mobile_app_pixel",
+            ha_notify_jess_service="notify.mobile_app_jwellz2",
             homelab_functions_token="secret",
             notification_ledger_path=str(Path(self.tmpdir.name) / "notifications.sqlite3"),
         )
@@ -176,6 +179,28 @@ class AppTests(AioHTTPTestCase):
                 "title": "Title",
                 "message": "Body",
                 "data": {"tag": "test"},
+            },
+        )
+        self.assertEqual(self.fake_ha.notify_service, "notify.mobile_app_pixel")
+
+    async def test_notify_jess_calls_jess_home_assistant_service(self):
+        response = await self.client.request(
+            "POST",
+            "/v1/notify/jess",
+            headers={"Authorization": "Bearer secret"},
+            json={"title": "Dinner plan", "message": "Please review.", "group": "mealie-planner"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["status"], "sent")
+        self.assertEqual(self.fake_ha.notify_service, "notify.mobile_app_jwellz2")
+        self.assertEqual(
+            self.fake_ha.service_data,
+            {
+                "title": "Dinner plan",
+                "message": "Please review.",
+                "data": {"group": "mealie-planner"},
             },
         )
 

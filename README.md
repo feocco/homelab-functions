@@ -4,8 +4,8 @@
 homelab actions.
 
 Use the deployed HTTP service for common stable functions, especially notifying
-Joe. Use the client-side Home Assistant helper for service-specific discovery,
-state reads, event listeners, and direct service calls.
+Joe or Jess. Use the client-side Home Assistant helper for service-specific
+discovery, state reads, event listeners, and direct service calls.
 
 ## Notify Joe
 
@@ -21,6 +21,22 @@ homelab.notify_joe(
 
 The helper calls the local `homelab-functions` HTTP service. Callers do not need
 Home Assistant credentials or WebSocket code.
+
+## Notify Jess
+
+```python
+import homelab
+
+homelab.notify_jess(
+    "Dinner plan",
+    "Please review and accept the weekly plan.",
+    tag="mealie-planner-plan-id",
+    group="mealie-planner",
+)
+```
+
+Jess notifications use the same broker and payload shape as Joe notifications,
+but route to the configured `HA_NOTIFY_JESS_SERVICE`.
 
 ## Home Assistant Client Helper
 
@@ -98,10 +114,11 @@ proxy. Add named server endpoints only for stable reusable actions.
 
 - `GET /health`
 - `POST /v1/notify/joe`
+- `POST /v1/notify/jess`
 - `GET /v1/notifications`
 - `POST /v1/notifications/actions`
 
-`POST /v1/notify/joe` requires:
+`POST /v1/notify/joe` and `POST /v1/notify/jess` require:
 
 ```text
 Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN
@@ -158,6 +175,7 @@ Server runtime environment:
 HA_URL=https://example.ui.nabu.casa
 HA_LONG_LIVED_TOKEN=replace_me
 HA_NOTIFY_JOE_SERVICE=notify.mobile_app_your_phone
+HA_NOTIFY_JESS_SERVICE=notify.mobile_app_jess_phone
 HOMELAB_FUNCTIONS_TOKEN=replace_me
 SERVICE_HOST=0.0.0.0
 SERVICE_PORT=8091

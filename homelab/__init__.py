@@ -1,6 +1,7 @@
 from homelab.client import (
     HomelabFunctionsError,
     list_notifications,
+    notify_jess,
     notify_joe,
     record_notification_action,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "HomelabFunctionsError",
     "NotificationActionRouter",
     "list_notifications",
+    "notify_jess",
     "notify_joe",
     "record_notification_action",
     "websocket_url",
