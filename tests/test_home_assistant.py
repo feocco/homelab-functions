@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from unittest.mock import patch
@@ -131,3 +132,32 @@ class HomeAssistantWebSocketClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(session.closed)
         self.assertIsNone(client._session)
         self.assertIsNone(client._ws)
+
+    async def test_event_handler_can_make_request_on_same_websocket(self):
+        websocket = FakeWebSocket([])
+        client = self.make_client()
+        client._ws = websocket
+        handler_results = []
+
+        async def handler(_event):
+            handler_results.append(await client.call_service("script", "turn_on", {"entity_id": "script.test"}))
+
+        client.add_event_handler(handler)
+
+        client._dispatch_event({"event_type": "mobile_app_notification_action"})
+        while not websocket.sent:
+            await asyncio.sleep(0)
+        client._finish_pending({"type": "result", "id": 1, "success": True, "result": {"ok": True}})
+        await asyncio.gather(*client._event_tasks)
+
+        self.assertEqual(handler_results, [{"ok": True}])
+        self.assertIn(
+            {
+                "id": 1,
+                "type": "call_service",
+                "domain": "script",
+                "service": "turn_on",
+                "service_data": {"entity_id": "script.test"},
+            },
+            websocket.sent,
+        )

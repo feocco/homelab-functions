@@ -9,6 +9,7 @@ event streams through the deployed homelab-functions HTTP server.
 
 import asyncio
 import itertools
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -18,6 +19,7 @@ from aiohttp import ClientSession, ClientTimeout, ClientWebSocketResponse, WSMsg
 
 
 EventHandler = Callable[[dict[str, Any]], Awaitable[None]]
+LOGGER = logging.getLogger(__name__)
 
 
 class HomeAssistantError(RuntimeError):
@@ -84,6 +86,7 @@ class HomeAssistantWebSocketClient:
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._event_handlers: list[EventHandler] = []
         self._reader_task: asyncio.Task[None] | None = None
+        self._event_tasks: set[asyncio.Task[None]] = set()
 
     @classmethod
     def from_env(cls) -> "HomeAssistantWebSocketClient":
@@ -132,6 +135,13 @@ class HomeAssistantWebSocketClient:
             except asyncio.CancelledError:
                 pass
             self._reader_task = None
+        current_task = asyncio.current_task()
+        handler_tasks = [task for task in self._event_tasks if task is not current_task]
+        for task in handler_tasks:
+            task.cancel()
+        if handler_tasks:
+            await asyncio.gather(*handler_tasks, return_exceptions=True)
+        self._event_tasks.difference_update(handler_tasks)
         if self._ws and not self._ws.closed:
             await self._ws.close()
         if self._session:
@@ -213,7 +223,7 @@ class HomeAssistantWebSocketClient:
             if payload.get("type") == "result":
                 self._finish_pending(payload)
             elif payload.get("type") == "event":
-                await self._dispatch_event(payload.get("event") or {})
+                self._dispatch_event(payload.get("event") or {})
 
     def _finish_pending(self, payload: dict[str, Any]) -> None:
         message_id = payload.get("id")
@@ -231,9 +241,23 @@ class HomeAssistantWebSocketClient:
             message = "request failed"
         future.set_exception(HomeAssistantError(f"Home Assistant request failed: {message}"))
 
-    async def _dispatch_event(self, event: dict[str, Any]) -> None:
+    def _dispatch_event(self, event: dict[str, Any]) -> None:
+        task = asyncio.create_task(self._run_event_handlers(event), name="homelab-ha-event-handler")
+        self._event_tasks.add(task)
+        task.add_done_callback(self._event_tasks.discard)
+        task.add_done_callback(self._log_event_task_failure)
+
+    async def _run_event_handlers(self, event: dict[str, Any]) -> None:
         for handler in list(self._event_handlers):
             await handler(event)
+
+    def _log_event_task_failure(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            LOGGER.exception("Home Assistant event handler failed")
 
 
 def websocket_url(ha_url: str) -> str:

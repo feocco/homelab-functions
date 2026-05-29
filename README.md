@@ -52,6 +52,10 @@ async with homelab.HomeAssistantWebSocketClient.from_env() as ha:
     await ha.call_service("switch", "turn_on", {"entity_id": "switch.example"})
 ```
 
+Subscribed event handlers run outside the WebSocket reader task, so a handler can
+call `get_states()` or `call_service()` on the same client without blocking the
+response reader.
+
 The helper reads:
 
 ```text
