@@ -12,6 +12,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+from .action_recorder import NotificationActionRecorder
+from .home_assistant import HomeAssistantConfig
 from .notification_ledger import NotificationLedger
 
 
@@ -54,6 +56,7 @@ class Config:
     request_timeout_seconds: float = 10
     log_level: str = "INFO"
     notification_ledger_path: str = "/app/data/notifications.sqlite3"
+    notification_action_recorder_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -81,6 +84,10 @@ class Config:
             notification_ledger_path=os.environ.get(
                 "NOTIFICATION_LEDGER_PATH",
                 "/app/data/notifications.sqlite3",
+            ),
+            notification_action_recorder_enabled=env_bool(
+                "NOTIFICATION_ACTION_RECORDER_ENABLED",
+                default=True,
             ),
         )
 
@@ -166,6 +173,13 @@ def load_dotenv(path: str = ".env") -> None:
                 continue
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
+
+
+def env_bool(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def split_ha_notify_service(value: str) -> tuple[str, str]:
@@ -304,6 +318,8 @@ def build_service_data(notification: dict[str, Any]) -> dict[str, Any]:
 CONFIG_KEY = web.AppKey("config", Config)
 HA_CLIENT_KEY = web.AppKey("ha_client", HomeAssistantClient)
 LEDGER_KEY = web.AppKey("notification_ledger", NotificationLedger)
+ACTION_RECORDER_KEY = web.AppKey("notification_action_recorder", NotificationActionRecorder)
+ACTION_RECORDER_TASK_KEY = web.AppKey("notification_action_recorder_task", asyncio.Task[None])
 
 
 def create_app(
@@ -315,16 +331,50 @@ def create_app(
     app[CONFIG_KEY] = config
     app[HA_CLIENT_KEY] = ha_client or HomeAssistantClient(config)
     app[LEDGER_KEY] = ledger or NotificationLedger(config.notification_ledger_path)
+    if config.notification_action_recorder_enabled:
+        app[ACTION_RECORDER_KEY] = NotificationActionRecorder(
+            app[LEDGER_KEY],
+            HomeAssistantConfig(
+                ha_url=config.ha_url,
+                ha_long_lived_token=config.ha_long_lived_token,
+                request_timeout_seconds=config.request_timeout_seconds,
+            ),
+        )
+        app.on_startup.append(start_action_recorder)
+        app.on_cleanup.append(stop_action_recorder)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/notify/joe", notify_joe)
     app.router.add_post("/v1/notify/jess", notify_jess)
     app.router.add_get("/v1/notifications", list_notifications)
     app.router.add_post("/v1/notifications/actions", record_notification_action)
+    app.router.add_post("/v1/workflow-reports", record_workflow_report)
+    app.router.add_get("/v1/workflow-reports", list_workflow_reports)
+    app.router.add_get("/v1/workflow-reports/{report_id}", get_workflow_report)
     return app
+
+
+async def start_action_recorder(app: web.Application) -> None:
+    recorder = app[ACTION_RECORDER_KEY]
+    app[ACTION_RECORDER_TASK_KEY] = asyncio.create_task(
+        recorder.run_forever(),
+        name="homelab-notification-action-recorder",
+    )
+
+
+async def stop_action_recorder(app: web.Application) -> None:
+    task = app.get(ACTION_RECORDER_TASK_KEY)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 async def health(request: web.Request) -> web.Response:
     config = request.app[CONFIG_KEY]
+    recorder = request.app.get(ACTION_RECORDER_KEY)
     return web.json_response(
         {
             "status": "ok",
@@ -334,6 +384,14 @@ async def health(request: web.Request) -> web.Response:
             "ha_notify_jess_service_configured": bool(config.ha_notify_jess_service),
             "token_configured": bool(config.homelab_functions_token),
             "notification_ledger_configured": bool(config.notification_ledger_path),
+            "notification_action_recorder_enabled": config.notification_action_recorder_enabled,
+            "notification_action_recorder_connected": bool(recorder and recorder.connected),
+            "notification_action_recorder_last_action_id": (
+                recorder.last_action_id if recorder is not None else None
+            ),
+            "notification_action_recorder_last_error": (
+                recorder.last_error if recorder is not None else ""
+            ),
         }
     )
 
@@ -431,6 +489,71 @@ async def record_notification_action(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def record_workflow_report(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    if not authorized(request, config.homelab_functions_token):
+        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
+
+    try:
+        payload = await request.json()
+        report = validate_workflow_report_payload(payload)
+    except ValidationError as exc:
+        return error_response(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            str(exc),
+            detail=exc.field,
+        )
+
+    recorded = request.app[LEDGER_KEY].record_workflow_report(report)
+    return web.json_response(
+        {
+            "status": "reported",
+            "report_id": recorded["id"],
+            "report": recorded,
+        }
+    )
+
+
+async def list_workflow_reports(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    if not authorized(request, config.homelab_functions_token):
+        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
+
+    limit = parse_limit(request.query.get("limit"))
+    reports = request.app[LEDGER_KEY].list_workflow_reports(
+        limit=limit,
+        workflow=optional_query_string(request.query.get("workflow")),
+    )
+    return web.json_response({"reports": reports})
+
+
+async def get_workflow_report(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    if not authorized(request, config.homelab_functions_token):
+        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
+
+    try:
+        report_id = int(request.match_info["report_id"])
+    except ValueError:
+        return error_response(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            "report_id must be an integer",
+            detail="report_id",
+        )
+
+    report = request.app[LEDGER_KEY].get_workflow_report(report_id)
+    if report is None:
+        return error_response(
+            HTTPStatus.NOT_FOUND,
+            "not_found",
+            "Workflow report not found",
+            detail="report_id",
+        )
+    return web.json_response({"report": report})
+
+
 def parse_limit(raw_limit: str | None) -> int:
     if raw_limit is None or not raw_limit.strip():
         return 50
@@ -462,6 +585,36 @@ def validate_notification_action_payload(payload: Any) -> dict[str, Any]:
             if not isinstance(value, str) or not value.strip():
                 raise ValidationError(f"{field} must be a non-empty string", field=field)
             validated[field] = value.strip()
+
+    event = payload.get("event")
+    if event is not None:
+        if not isinstance(event, dict):
+            raise ValidationError("event must be an object", field="event")
+        validated["event"] = event
+
+    return validated
+
+
+def validate_workflow_report_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValidationError("Request body must be a JSON object")
+
+    validated: dict[str, Any] = {
+        "workflow_slug": required_string(payload, "workflow_slug"),
+        "summary": required_string(payload, "summary"),
+    }
+
+    source = payload.get("source")
+    if source is not None:
+        if not isinstance(source, str) or not source.strip():
+            raise ValidationError("source must be a non-empty string", field="source")
+        validated["source"] = source.strip()
+
+    notification_id = payload.get("notification_id")
+    if notification_id is not None:
+        if not isinstance(notification_id, int):
+            raise ValidationError("notification_id must be an integer", field="notification_id")
+        validated["notification_id"] = notification_id
 
     event = payload.get("event")
     if event is not None:

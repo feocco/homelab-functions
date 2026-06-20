@@ -10,6 +10,7 @@ from homelab.server import (
     create_app,
     split_ha_notify_service,
     validate_notification_payload,
+    validate_workflow_report_payload,
     websocket_url,
 )
 
@@ -123,6 +124,35 @@ class ValidationTests(unittest.TestCase):
             "wss://example.ui.nabu.casa/api/websocket",
         )
 
+    def test_validates_workflow_report_payload(self):
+        report = validate_workflow_report_payload(
+            {
+                "workflow_slug": "cat-food-monitor",
+                "summary": "The morning check did not run.",
+                "source": "mobile-action",
+                "notification_id": 12,
+                "event": {"sourceDeviceName": "Pixel"},
+            }
+        )
+
+        self.assertEqual(
+            report,
+            {
+                "workflow_slug": "cat-food-monitor",
+                "summary": "The morning check did not run.",
+                "source": "mobile-action",
+                "notification_id": 12,
+                "event": {"sourceDeviceName": "Pixel"},
+            },
+        )
+
+    def test_requires_workflow_report_slug_and_summary(self):
+        with self.assertRaisesRegex(ValueError, "workflow_slug is required"):
+            validate_workflow_report_payload({"summary": "Broken"})
+
+        with self.assertRaisesRegex(ValueError, "summary is required"):
+            validate_workflow_report_payload({"workflow_slug": "cat-food-monitor"})
+
 
 class AppTests(AioHTTPTestCase):
     async def get_application(self):
@@ -135,6 +165,7 @@ class AppTests(AioHTTPTestCase):
             ha_notify_jess_service="notify.mobile_app_jwellz2",
             homelab_functions_token="secret",
             notification_ledger_path=str(Path(self.tmpdir.name) / "notifications.sqlite3"),
+            notification_action_recorder_enabled=False,
         )
         return create_app(config, ha_client=self.fake_ha)
 
@@ -281,3 +312,97 @@ class AppTests(AioHTTPTestCase):
         self.assertEqual(len(record["actions"]), 1)
         self.assertEqual(record["actions"][0]["action"], "HASS_JANITOR_CONFIRM_UPDATE")
         self.assertEqual(record["actions"][0]["reply_text"], "run it")
+
+    async def test_workflow_report_requires_bearer_token(self):
+        response = await self.client.request(
+            "POST",
+            "/v1/workflow-reports",
+            json={"workflow_slug": "cat-food-monitor", "summary": "Broken"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 401)
+        self.assertEqual(payload["error"]["code"], "unauthorized")
+
+    async def test_records_workflow_report(self):
+        response = await self.client.request(
+            "POST",
+            "/v1/workflow-reports",
+            headers={"Authorization": "Bearer secret"},
+            json={
+                "workflow_slug": "cat-food-monitor",
+                "summary": "Bowl sensor stayed empty after refill.",
+                "source": "mobile-action",
+                "notification_id": 42,
+                "event": {"sourceDeviceName": "Pixel"},
+            },
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["status"], "reported")
+        self.assertIsInstance(payload["report_id"], int)
+        self.assertEqual(payload["report"]["workflow_slug"], "cat-food-monitor")
+        self.assertEqual(payload["report"]["summary"], "Bowl sensor stayed empty after refill.")
+        self.assertEqual(payload["report"]["source"], "mobile-action")
+        self.assertEqual(payload["report"]["notification_id"], 42)
+        self.assertEqual(payload["report"]["event"], {"sourceDeviceName": "Pixel"})
+
+    async def test_workflow_report_rejects_invalid_request(self):
+        response = await self.client.request(
+            "POST",
+            "/v1/workflow-reports",
+            headers={"Authorization": "Bearer secret"},
+            json={"workflow_slug": "cat-food-monitor"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(payload["error"]["code"], "invalid_request")
+        self.assertEqual(payload["error"]["detail"], "summary")
+
+    async def test_lists_workflow_reports_by_workflow(self):
+        await self.client.request(
+            "POST",
+            "/v1/workflow-reports",
+            headers={"Authorization": "Bearer secret"},
+            json={"workflow_slug": "cat-food-monitor", "summary": "First issue"},
+        )
+        await self.client.request(
+            "POST",
+            "/v1/workflow-reports",
+            headers={"Authorization": "Bearer secret"},
+            json={"workflow_slug": "plant-monitor", "summary": "Other issue"},
+        )
+
+        response = await self.client.request(
+            "GET",
+            "/v1/workflow-reports?workflow=cat-food-monitor&limit=20",
+            headers={"Authorization": "Bearer secret"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(payload["reports"]), 1)
+        self.assertEqual(payload["reports"][0]["workflow_slug"], "cat-food-monitor")
+        self.assertEqual(payload["reports"][0]["summary"], "First issue")
+
+    async def test_gets_workflow_report_by_id(self):
+        create_response = await self.client.request(
+            "POST",
+            "/v1/workflow-reports",
+            headers={"Authorization": "Bearer secret"},
+            json={"workflow_slug": "cat-food-monitor", "summary": "Needs investigation"},
+        )
+        create_payload = await create_response.json()
+
+        response = await self.client.request(
+            "GET",
+            f"/v1/workflow-reports/{create_payload['report_id']}",
+            headers={"Authorization": "Bearer secret"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["report"]["id"], create_payload["report_id"])
+        self.assertEqual(payload["report"]["summary"], "Needs investigation")

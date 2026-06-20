@@ -9,6 +9,51 @@ from homelab.home_assistant import (
     HomeAssistantWebSocketClient,
     websocket_url,
 )
+from homelab.notification_ledger import NotificationLedger
+
+
+class NotificationActionRecorderTests(unittest.TestCase):
+    def test_records_mobile_notification_action_event(self):
+        from homelab.action_recorder import record_notification_action_event
+
+        with self.subTest("synthetic mobile action is attached to latest matching notification"):
+            from tempfile import TemporaryDirectory
+            from pathlib import Path
+
+            with TemporaryDirectory() as tmpdir:
+                ledger = NotificationLedger(str(Path(tmpdir) / "notifications.sqlite3"))
+                notification = ledger.record_sent(
+                    {
+                        "title": "Updates available",
+                        "message": "One update needs review.",
+                        "tag": "hass-janitor-update-confirm",
+                        "group": "hass-janitor",
+                    },
+                    {"title": "Updates available", "message": "One update needs review."},
+                    ha_context_id="context-123",
+                )
+
+                result = record_notification_action_event(
+                    ledger,
+                    {
+                        "event_type": "mobile_app_notification_action",
+                        "data": {
+                            "action": "HASS_JANITOR_CONFIRM_UPDATE::token",
+                            "tag": "hass-janitor-update-confirm",
+                            "group": "hass-janitor",
+                            "sourceDeviceName": "Pixel",
+                        },
+                    },
+                )
+
+                record = ledger.get_notification(notification["id"])
+
+        self.assertEqual(result["status"], "recorded")
+        self.assertEqual(result["notification_id"], notification["id"])
+        self.assertIsNotNone(record)
+        self.assertEqual(record["status"], "responded")
+        self.assertEqual(record["actions"][0]["action"], "HASS_JANITOR_CONFIRM_UPDATE::token")
+        self.assertEqual(record["actions"][0]["event"]["sourceDeviceName"], "Pixel")
 
 
 class HomeAssistantHelperTests(unittest.TestCase):

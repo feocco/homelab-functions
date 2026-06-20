@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_FUNCTIONS_URL = "http://127.0.0.1:8091"
+WORKFLOW_REPORT_ACTION_PREFIX = "WORKFLOW_REPORT"
 
 
 class HomelabFunctionsError(RuntimeError):
@@ -136,6 +137,54 @@ def record_notification_action(
 
     return _post_json(
         "/v1/notifications/actions",
+        payload,
+        service_url=service_url,
+        token=token,
+        timeout=timeout,
+    )
+
+
+def workflow_report_button(workflow_slug: str) -> dict[str, str]:
+    """Return a standard Home Assistant text-input button for workflow reports."""
+
+    slug = workflow_slug.strip()
+    if not slug:
+        raise ValueError("workflow_slug is required")
+    return {
+        "title": "Report",
+        "action": f"{WORKFLOW_REPORT_ACTION_PREFIX}::{slug}",
+        "behavior": "textInput",
+        "textInputButtonTitle": "Send",
+        "textInputPlaceholder": "What went wrong?",
+    }
+
+
+def record_workflow_report(
+    workflow_slug: str,
+    summary: str,
+    *,
+    source: str | None = None,
+    notification_id: int | None = None,
+    event: dict[str, Any] | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Record a human-submitted workflow incident for later investigation."""
+
+    payload: dict[str, Any] = {
+        "workflow_slug": workflow_slug,
+        "summary": summary,
+    }
+    if source is not None:
+        payload["source"] = source
+    if notification_id is not None:
+        payload["notification_id"] = notification_id
+    if event is not None:
+        payload["event"] = event
+
+    return _post_json(
+        "/v1/workflow-reports",
         payload,
         service_url=service_url,
         token=token,

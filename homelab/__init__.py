@@ -4,6 +4,8 @@ from homelab.client import (
     notify_jess,
     notify_joe,
     record_notification_action,
+    record_workflow_report,
+    workflow_report_button,
 )
 from homelab.home_assistant import (
     HomeAssistantConfig,
@@ -23,5 +25,7 @@ __all__ = [
     "notify_jess",
     "notify_joe",
     "record_notification_action",
+    "record_workflow_report",
+    "workflow_report_button",
     "websocket_url",
 ]

@@ -4,7 +4,15 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from homelab.client import HomelabFunctionsError, list_notifications, notify_jess, notify_joe, record_notification_action
+from homelab.client import (
+    HomelabFunctionsError,
+    list_notifications,
+    notify_jess,
+    notify_joe,
+    record_notification_action,
+    record_workflow_report,
+    workflow_report_button,
+)
 
 
 class FakeResponse:
@@ -97,6 +105,46 @@ class ClientTests(unittest.TestCase):
                 "tag": "hass-janitor-update-confirm",
                 "group": "hass-janitor",
                 "reply_text": "run it",
+                "event": {"sourceDeviceName": "Pixel"},
+            },
+        )
+
+    def test_builds_workflow_report_button(self):
+        self.assertEqual(
+            workflow_report_button("cat-food-monitor"),
+            {
+                "title": "Report",
+                "action": "WORKFLOW_REPORT::cat-food-monitor",
+                "behavior": "textInput",
+                "textInputButtonTitle": "Send",
+                "textInputPlaceholder": "What went wrong?",
+            },
+        )
+
+    @patch("homelab.client.urlopen")
+    def test_records_workflow_report(self, urlopen):
+        urlopen.return_value = FakeResponse({"status": "reported", "report_id": 7})
+
+        result = record_workflow_report(
+            "cat-food-monitor",
+            "The morning check did not run.",
+            source="mobile-action",
+            notification_id=12,
+            event={"sourceDeviceName": "Pixel"},
+            service_url="http://homelab-functions:8080",
+            token="secret",
+        )
+
+        self.assertEqual(result, {"status": "reported", "report_id": 7})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://homelab-functions:8080/v1/workflow-reports")
+        self.assertEqual(
+            json.loads(request.data.decode("utf-8")),
+            {
+                "workflow_slug": "cat-food-monitor",
+                "summary": "The morning check did not run.",
+                "source": "mobile-action",
+                "notification_id": 12,
                 "event": {"sourceDeviceName": "Pixel"},
             },
         )

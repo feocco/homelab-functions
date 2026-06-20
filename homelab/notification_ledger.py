@@ -48,6 +48,18 @@ class NotificationLedger:
                     event_json TEXT NOT NULL,
                     FOREIGN KEY(notification_id) REFERENCES notifications(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS workflow_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    workflow_slug TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    source TEXT,
+                    notification_id INTEGER,
+                    event_json TEXT NOT NULL
+                );
                 """
             )
 
@@ -90,6 +102,11 @@ class NotificationLedger:
         timestamp = utc_now()
         tag = action_event.get("tag")
         group = action_event.get("group")
+        event_json = stable_json(action_event.get("event") or {})
+        existing = self._existing_action(action=action_event["action"], tag=tag, group=group, event_json=event_json)
+        if existing is not None:
+            return existing
+
         notification_id = self._latest_matching_notification_id(tag=tag, group=group)
 
         with self._connect() as connection:
@@ -107,7 +124,7 @@ class NotificationLedger:
                     tag,
                     group,
                     action_event.get("reply_text"),
-                    stable_json(action_event.get("event") or {}),
+                    event_json,
                 ),
             )
             action_id = int(cursor.lastrowid)
@@ -121,6 +138,35 @@ class NotificationLedger:
             "status": "recorded",
             "action_id": action_id,
             "notification_id": notification_id,
+        }
+
+    def _existing_action(
+        self,
+        *,
+        action: str,
+        tag: str | None,
+        group: str | None,
+        event_json: str,
+    ) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, notification_id FROM notification_actions
+                WHERE action = ?
+                  AND COALESCE(tag, '') = COALESCE(?, '')
+                  AND COALESCE(group_name, '') = COALESCE(?, '')
+                  AND event_json = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (action, tag, group, event_json),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": "recorded",
+            "action_id": int(row["id"]),
+            "notification_id": row["notification_id"],
         }
 
     def list_notifications(
@@ -151,6 +197,65 @@ class NotificationLedger:
                 [*params, limit],
             ).fetchall()
         return [self._notification_from_row(row) for row in rows]
+
+    def record_workflow_report(self, report: dict[str, Any]) -> dict[str, Any]:
+        timestamp = utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO workflow_reports (
+                    created_at, updated_at, status, workflow_slug, summary,
+                    source, notification_id, event_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    timestamp,
+                    "reported",
+                    report["workflow_slug"],
+                    report["summary"],
+                    report.get("source"),
+                    report.get("notification_id"),
+                    stable_json(report.get("event") or {}),
+                ),
+            )
+            report_id = int(cursor.lastrowid)
+
+        return self.get_workflow_report(report_id) or {}
+
+    def list_workflow_reports(
+        self,
+        *,
+        limit: int = 50,
+        workflow: str | None = None,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(limit, 100))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if workflow:
+            clauses.append("workflow_slug = ?")
+            params.append(workflow)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM workflow_reports
+                {where}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                [*params, limit],
+            ).fetchall()
+        return [self._workflow_report_from_row(row) for row in rows]
+
+    def get_workflow_report(self, report_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_reports WHERE id = ?",
+                (report_id,),
+            ).fetchone()
+        return self._workflow_report_from_row(row) if row else None
 
     def get_notification(self, notification_id: int) -> dict[str, Any] | None:
         with self._connect() as connection:
@@ -225,6 +330,19 @@ class NotificationLedger:
             }
             for row in rows
         ]
+
+    def _workflow_report_from_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "status": row["status"],
+            "workflow_slug": row["workflow_slug"],
+            "summary": row["summary"],
+            "source": row["source"],
+            "notification_id": row["notification_id"],
+            "event": json.loads(row["event_json"]),
+        }
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path)

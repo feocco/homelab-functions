@@ -93,9 +93,10 @@ async def handle_ha_event(event: dict) -> None:
     router.handle_event(event)
 ```
 
-The deployed `homelab-functions` server should not become a generic action
-router. Each long-running service owns its own Home Assistant listener and
-business logic.
+The deployed `homelab-functions` server records
+`mobile_app_notification_action` events in the shared notification ledger, but
+it does not route or execute those actions. Each long-running service still owns
+its own Home Assistant listener and business logic.
 
 Buttons that request a typed response can include Home Assistant text-input
 fields. The service that listens for the action reads `reply_text` from the
@@ -121,6 +122,9 @@ proxy. Add named server endpoints only for stable reusable actions.
 - `POST /v1/notify/jess`
 - `GET /v1/notifications`
 - `POST /v1/notifications/actions`
+- `POST /v1/workflow-reports`
+- `GET /v1/workflow-reports`
+- `GET /v1/workflow-reports/{id}`
 
 `POST /v1/notify/joe` and `POST /v1/notify/jess` require:
 
@@ -171,6 +175,61 @@ The recent ledger can be inspected with:
 homelab.list_notifications(group="plant-monitor", limit=20)
 ```
 
+## Workflow Reports
+
+Workflow reports are a standard way to turn a phone notification into a durable
+"please investigate this workflow" record. A workflow can add the shared Report
+button to any notification:
+
+```python
+import homelab
+
+homelab.notify_joe(
+    "Cat food monitor",
+    "Morning food check failed.",
+    tag="cat-food-monitor-morning",
+    group="cat-food-monitor",
+    buttons=[homelab.workflow_report_button("cat-food-monitor")],
+)
+```
+
+The Report button uses Home Assistant's mobile text-input action. The workflow
+that listens for `mobile_app_notification_action` events records Joe's submitted
+text:
+
+```python
+import homelab
+
+router = homelab.NotificationActionRouter()
+
+
+def handle_report(workflow_slug: str, event: dict) -> None:
+    data = event.get("data", {})
+    homelab.record_workflow_report(
+        workflow_slug,
+        data["reply_text"],
+        source="mobile-action",
+        event=data,
+    )
+
+
+router.register("WORKFLOW_REPORT", handle_report)
+```
+
+Workflow slugs are caller-owned strings. Prefer stable kebab-case names such as
+`cat-food-monitor`, but `homelab-functions` does not keep a workflow registry.
+
+Recent reports can be inspected through the service API:
+
+```bash
+curl -H "Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN" \
+  "$HOMELAB_FUNCTIONS_URL/v1/workflow-reports?workflow=cat-food-monitor&limit=20"
+```
+
+V1 only records reports. It does not launch Codex, Cursor, GitHub issues, or a
+webhook. Future investigator services should consume these report records by id
+or through a dedicated relay.
+
 ## Configuration
 
 Server runtime environment:
@@ -187,6 +246,7 @@ TZ=America/New_York
 LOG_LEVEL=INFO
 REQUEST_TIMEOUT_SECONDS=10
 NOTIFICATION_LEDGER_PATH=/app/data/notifications.sqlite3
+NOTIFICATION_ACTION_RECORDER_ENABLED=true
 ```
 
 Client helper environment:
