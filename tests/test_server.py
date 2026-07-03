@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -158,12 +159,34 @@ class AppTests(AioHTTPTestCase):
     async def get_application(self):
         self.fake_ha = FakeHomeAssistantClient()
         self.tmpdir = TemporaryDirectory()
+        self.catalog_path = Path(self.tmpdir.name) / "service-catalog.json"
+        self.smoke_targets_path = Path(self.tmpdir.name) / "smoke-signal-targets.json"
+        self.catalog_path.write_text(
+            json.dumps(
+                {
+                    "schema": "homelab-service-catalog.v1",
+                    "services": [{"service": "grafana", "host": "macmini", "enabled": True}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.smoke_targets_path.write_text(
+            json.dumps(
+                {
+                    "schema": "homelab-smoke-signal-targets.v1",
+                    "targets": [{"name": "Grafana", "url": "http://grafana.local/api/health"}],
+                }
+            ),
+            encoding="utf-8",
+        )
         config = Config(
             ha_url="https://example.ui.nabu.casa",
             ha_long_lived_token="ha-token",
             ha_notify_joe_service="notify.mobile_app_pixel",
             ha_notify_jess_service="notify.mobile_app_jwellz2",
             homelab_functions_token="secret",
+            homelab_catalog_path=str(self.catalog_path),
+            homelab_smoke_signal_targets_path=str(self.smoke_targets_path),
             notification_ledger_path=str(Path(self.tmpdir.name) / "notifications.sqlite3"),
             notification_action_recorder_enabled=False,
         )
@@ -201,12 +224,71 @@ class AppTests(AioHTTPTestCase):
         self.assertEqual(payload["info"]["title"], "homelab-functions")
         self.assertIn("/health", payload["paths"])
         self.assertIn("/v1/notify/joe", payload["paths"])
+        self.assertIn("/v1/catalog/services", payload["paths"])
+        self.assertIn("/v1/catalog/smoke-signal-targets", payload["paths"])
         self.assertIn("/v1/workflow-reports/{report_id}", payload["paths"])
         self.assertEqual(
             payload["paths"]["/v1/notify/joe"]["post"]["security"],
             [{"bearerAuth": []}],
         )
         self.assertIn("bearerAuth", payload["components"]["securitySchemes"])
+
+    async def test_catalog_services_requires_bearer_token(self):
+        response = await self.client.request("GET", "/v1/catalog/services")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 401)
+        self.assertEqual(payload["error"]["code"], "unauthorized")
+
+    async def test_catalog_services_returns_generated_catalog(self):
+        response = await self.client.request(
+            "GET",
+            "/v1/catalog/services",
+            headers={"Authorization": "Bearer secret"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["schema"], "homelab-service-catalog.v1")
+        self.assertEqual(payload["services"][0]["service"], "grafana")
+
+    async def test_smoke_signal_targets_returns_generated_targets(self):
+        response = await self.client.request(
+            "GET",
+            "/v1/catalog/smoke-signal-targets",
+            headers={"Authorization": "Bearer secret"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["schema"], "homelab-smoke-signal-targets.v1")
+        self.assertEqual(payload["targets"][0]["name"], "Grafana")
+
+    async def test_catalog_response_handles_missing_file(self):
+        self.catalog_path.unlink()
+
+        response = await self.client.request(
+            "GET",
+            "/v1/catalog/services",
+            headers={"Authorization": "Bearer secret"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(payload["error"]["code"], "catalog_unavailable")
+
+    async def test_catalog_response_handles_malformed_json(self):
+        self.smoke_targets_path.write_text("{not-json", encoding="utf-8")
+
+        response = await self.client.request(
+            "GET",
+            "/v1/catalog/smoke-signal-targets",
+            headers={"Authorization": "Bearer secret"},
+        )
+        payload = await response.json()
+
+        self.assertEqual(response.status, 503)
+        self.assertEqual(payload["error"]["code"], "catalog_unavailable")
 
     async def test_notify_requires_bearer_token(self):
         response = await self.client.request(

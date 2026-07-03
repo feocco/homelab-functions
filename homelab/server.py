@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import re
@@ -44,6 +45,10 @@ class HomeAssistantError(RuntimeError):
     pass
 
 
+class CatalogError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class Config:
     ha_url: str
@@ -57,6 +62,8 @@ class Config:
     log_level: str = "INFO"
     notification_ledger_path: str = "/app/data/notifications.sqlite3"
     notification_action_recorder_enabled: bool = True
+    homelab_catalog_path: str = "/app/config/service-catalog.json"
+    homelab_smoke_signal_targets_path: str = "/app/config/smoke-signal-targets.json"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -88,6 +95,14 @@ class Config:
             notification_action_recorder_enabled=env_bool(
                 "NOTIFICATION_ACTION_RECORDER_ENABLED",
                 default=True,
+            ),
+            homelab_catalog_path=os.environ.get(
+                "HOMELAB_CATALOG_PATH",
+                "/app/config/service-catalog.json",
+            ),
+            homelab_smoke_signal_targets_path=os.environ.get(
+                "HOMELAB_SMOKE_SIGNAL_TARGETS_PATH",
+                "/app/config/smoke-signal-targets.json",
             ),
         )
 
@@ -454,6 +469,28 @@ def service_openapi() -> dict[str, Any]:
                     },
                 }
             },
+            "/v1/catalog/services": {
+                "get": {
+                    "summary": "Return the generated homelab service catalog",
+                    "security": bearer_required,
+                    "responses": {
+                        "200": {"description": "Generated service catalog"},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                        "503": {"description": "Catalog file unavailable", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                }
+            },
+            "/v1/catalog/smoke-signal-targets": {
+                "get": {
+                    "summary": "Return the generated Smoke Signal target list",
+                    "security": bearer_required,
+                    "responses": {
+                        "200": {"description": "Generated Smoke Signal targets"},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                        "503": {"description": "Catalog file unavailable", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                }
+            },
             "/v1/workflow-reports": {
                 "post": {
                     "summary": "Record a workflow report",
@@ -554,6 +591,8 @@ def service_docs_html() -> str:
           <tr><td><code>POST</code></td><td><code>/v1/notify/jess</code></td><td>Send a mobile notification to Jess.</td><td>Bearer token</td></tr>
           <tr><td><code>GET</code></td><td><code>/v1/notifications</code></td><td>List notification records.</td><td>Bearer token</td></tr>
           <tr><td><code>POST</code></td><td><code>/v1/notifications/actions</code></td><td>Record mobile notification actions.</td><td>Bearer token</td></tr>
+          <tr><td><code>GET</code></td><td><code>/v1/catalog/services</code></td><td>Return the generated homelab service catalog.</td><td>Bearer token</td></tr>
+          <tr><td><code>GET</code></td><td><code>/v1/catalog/smoke-signal-targets</code></td><td>Return the generated Smoke Signal target list.</td><td>Bearer token</td></tr>
           <tr><td><code>POST</code></td><td><code>/v1/workflow-reports</code></td><td>Record workflow reports.</td><td>Bearer token</td></tr>
           <tr><td><code>GET</code></td><td><code>/v1/workflow-reports</code></td><td>List workflow reports.</td><td>Bearer token</td></tr>
           <tr><td><code>GET</code></td><td><code>/v1/workflow-reports/{id}</code></td><td>Fetch one workflow report.</td><td>Bearer token</td></tr>
@@ -601,6 +640,8 @@ def create_app(
     app.router.add_post("/v1/notify/jess", notify_jess)
     app.router.add_get("/v1/notifications", list_notifications)
     app.router.add_post("/v1/notifications/actions", record_notification_action)
+    app.router.add_get("/v1/catalog/services", catalog_services)
+    app.router.add_get("/v1/catalog/smoke-signal-targets", smoke_signal_targets)
     app.router.add_post("/v1/workflow-reports", record_workflow_report)
     app.router.add_get("/v1/workflow-reports", list_workflow_reports)
     app.router.add_get("/v1/workflow-reports/{report_id}", get_workflow_report)
@@ -749,6 +790,47 @@ async def record_notification_action(request: web.Request) -> web.Response:
 
     result = request.app[LEDGER_KEY].record_action(action_event)
     return web.json_response(result)
+
+
+async def catalog_services(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    if not authorized(request, config.homelab_functions_token):
+        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
+
+    return catalog_response(config.homelab_catalog_path, "service catalog")
+
+
+async def smoke_signal_targets(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    if not authorized(request, config.homelab_functions_token):
+        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
+
+    return catalog_response(config.homelab_smoke_signal_targets_path, "Smoke Signal targets")
+
+
+def catalog_response(path: str, label: str) -> web.Response:
+    try:
+        return web.json_response(load_json_file(path))
+    except CatalogError as exc:
+        LOGGER.warning("%s unavailable at %s: %s", label, path, exc)
+        return error_response(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            "catalog_unavailable",
+            f"{label} is unavailable",
+            detail=str(exc),
+        )
+
+
+def load_json_file(path: str) -> Any:
+    try:
+        with open(path, encoding="utf-8") as catalog_file:
+            return json.load(catalog_file)
+    except FileNotFoundError as exc:
+        raise CatalogError("file not found") from exc
+    except json.JSONDecodeError as exc:
+        raise CatalogError("file is not valid JSON") from exc
+    except OSError as exc:
+        raise CatalogError(str(exc)) from exc
 
 
 async def record_workflow_report(request: web.Request) -> web.Response:

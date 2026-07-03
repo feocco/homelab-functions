@@ -124,6 +124,8 @@ proxy. Add named server endpoints only for stable reusable actions.
 - `POST /v1/notify/jess`
 - `GET /v1/notifications`
 - `POST /v1/notifications/actions`
+- `GET /v1/catalog/services`
+- `GET /v1/catalog/smoke-signal-targets`
 - `POST /v1/workflow-reports`
 - `GET /v1/workflow-reports`
 - `GET /v1/workflow-reports/{id}`
@@ -136,6 +138,15 @@ Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN
 
 The browser docs page documents protected endpoints but does not store tokens
 or execute authenticated calls.
+
+The catalog endpoints serve generated JSON files mounted into the container.
+`homelab-config` owns the catalog generation; this service only authenticates
+and returns the files:
+
+```text
+HOMELAB_CATALOG_PATH=/app/config/service-catalog.json
+HOMELAB_SMOKE_SIGNAL_TARGETS_PATH=/app/config/smoke-signal-targets.json
+```
 
 Example request:
 

@@ -35,6 +35,21 @@ V1 records only. It does not start Codex, Cursor, GitHub issue creation, or an
 outbound webhook. This keeps the deployed service reliable and makes the report
 inbox useful before the investigator automation exists.
 
+## Catalog Flow
+
+`homelab-functions` exposes protected catalog reads for services that need a
+runtime view of the homelab without cloning `homelab-config`.
+
+`homelab-config` generates the JSON files during deploy and mounts them into
+the container. `homelab-functions` only checks the bearer token and returns the
+files:
+
+- `GET /v1/catalog/services`
+- `GET /v1/catalog/smoke-signal-targets`
+
+This keeps service truth in `homelab-config` while giving small runtime services
+like Smoke Signal a simple API and cacheable payload.
+
 ## Future Investigator Boundary
 
 The future investigator should be a separate service or agent workflow. It can
