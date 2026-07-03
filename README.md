@@ -118,6 +118,8 @@ proxy. Add named server endpoints only for stable reusable actions.
 ## Service API
 
 - `GET /health`
+- `GET /docs`
+- `GET /openapi.json`
 - `POST /v1/notify/joe`
 - `POST /v1/notify/jess`
 - `GET /v1/notifications`
@@ -126,11 +128,14 @@ proxy. Add named server endpoints only for stable reusable actions.
 - `GET /v1/workflow-reports`
 - `GET /v1/workflow-reports/{id}`
 
-`POST /v1/notify/joe` and `POST /v1/notify/jess` require:
+Protected endpoints require:
 
 ```text
 Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN
 ```
+
+The browser docs page documents protected endpoints but does not store tokens
+or execute authenticated calls.
 
 Example request:
 

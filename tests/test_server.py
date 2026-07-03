@@ -181,6 +181,33 @@ class AppTests(AioHTTPTestCase):
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["service"], "homelab-functions")
 
+    async def test_docs_page(self):
+        response = await self.client.request("GET", "/docs")
+        body = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/html", response.headers["Content-Type"])
+        self.assertIn("homelab-functions", body)
+        self.assertIn("/openapi.json", body)
+        self.assertIn("Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN", body)
+        self.assertIn("does not store tokens", body)
+
+    async def test_openapi_document(self):
+        response = await self.client.request("GET", "/openapi.json")
+        payload = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["openapi"], "3.1.0")
+        self.assertEqual(payload["info"]["title"], "homelab-functions")
+        self.assertIn("/health", payload["paths"])
+        self.assertIn("/v1/notify/joe", payload["paths"])
+        self.assertIn("/v1/workflow-reports/{report_id}", payload["paths"])
+        self.assertEqual(
+            payload["paths"]["/v1/notify/joe"]["post"]["security"],
+            [{"bearerAuth": []}],
+        )
+        self.assertIn("bearerAuth", payload["components"]["securitySchemes"])
+
     async def test_notify_requires_bearer_token(self):
         response = await self.client.request(
             "POST",

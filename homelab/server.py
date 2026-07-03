@@ -315,6 +315,258 @@ def build_service_data(notification: dict[str, Any]) -> dict[str, Any]:
     return service_data
 
 
+def service_openapi() -> dict[str, Any]:
+    bearer_required = [{"bearerAuth": []}]
+    error_response_schema = {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+            "error": {
+                "type": "object",
+                "required": ["code", "message"],
+                "properties": {
+                    "code": {"type": "string"},
+                    "message": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+            }
+        },
+    }
+    return {
+        "openapi": "3.1.0",
+        "info": {
+            "title": "homelab-functions",
+            "version": "0.1.0",
+            "description": "Notification and homelab API service for stable reusable actions.",
+        },
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "Use HOMELAB_FUNCTIONS_TOKEN. Browser docs intentionally do not store tokens.",
+                }
+            },
+            "schemas": {
+                "ErrorResponse": error_response_schema,
+                "NotificationRequest": {
+                    "type": "object",
+                    "required": ["title", "message"],
+                    "properties": {
+                        "title": {"type": "string"},
+                        "message": {"type": "string"},
+                        "tag": {"type": "string"},
+                        "group": {"type": "string"},
+                        "url": {"type": "string"},
+                        "buttons": {
+                            "type": "array",
+                            "maxItems": MAX_BUTTONS,
+                            "items": {"type": "object"},
+                        },
+                    },
+                },
+                "WorkflowReportRequest": {
+                    "type": "object",
+                    "required": ["workflow_slug", "summary"],
+                    "properties": {
+                        "workflow_slug": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "source": {"type": "string"},
+                        "notification_id": {"type": "integer"},
+                        "event": {"type": "object"},
+                    },
+                },
+            },
+        },
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Report service health",
+                    "responses": {
+                        "200": {
+                            "description": "Service health payload",
+                            "content": {"application/json": {"schema": {"type": "object"}}},
+                        }
+                    },
+                }
+            },
+            "/v1/notify/joe": {
+                "post": {
+                    "summary": "Send a mobile notification to Joe",
+                    "security": bearer_required,
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/NotificationRequest"}}
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Notification sent"},
+                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                }
+            },
+            "/v1/notify/jess": {
+                "post": {
+                    "summary": "Send a mobile notification to Jess",
+                    "security": bearer_required,
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/NotificationRequest"}}
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Notification sent"},
+                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                }
+            },
+            "/v1/notifications": {
+                "get": {
+                    "summary": "List notification records",
+                    "security": bearer_required,
+                    "parameters": [
+                        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+                        {"name": "group", "in": "query", "schema": {"type": "string"}},
+                        {"name": "tag", "in": "query", "schema": {"type": "string"}},
+                    ],
+                    "responses": {
+                        "200": {"description": "Notification records"},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                }
+            },
+            "/v1/notifications/actions": {
+                "post": {
+                    "summary": "Record a mobile notification action",
+                    "security": bearer_required,
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    },
+                    "responses": {
+                        "200": {"description": "Recorded action"},
+                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                }
+            },
+            "/v1/workflow-reports": {
+                "post": {
+                    "summary": "Record a workflow report",
+                    "security": bearer_required,
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {"schema": {"$ref": "#/components/schemas/WorkflowReportRequest"}}
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "Recorded workflow report"},
+                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                },
+                "get": {
+                    "summary": "List workflow reports",
+                    "security": bearer_required,
+                    "parameters": [
+                        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
+                        {"name": "workflow", "in": "query", "schema": {"type": "string"}},
+                    ],
+                    "responses": {
+                        "200": {"description": "Workflow report records"},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                },
+            },
+            "/v1/workflow-reports/{report_id}": {
+                "get": {
+                    "summary": "Get one workflow report",
+                    "security": bearer_required,
+                    "parameters": [
+                        {"name": "report_id", "in": "path", "required": True, "schema": {"type": "integer"}}
+                    ],
+                    "responses": {
+                        "200": {"description": "Workflow report"},
+                        "400": {"description": "Invalid report id", "content": {"application/json": {"schema": error_response_schema}}},
+                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
+                        "404": {"description": "Report not found", "content": {"application/json": {"schema": error_response_schema}}},
+                    },
+                }
+            },
+        },
+    }
+
+
+def service_docs_html() -> str:
+    return """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>homelab-functions API</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f6f7f9;
+        color: #18202f;
+      }
+      body { margin: 0; }
+      main { max-width: 980px; margin: 0 auto; padding: 48px 20px 64px; }
+      h1 { margin: 0 0 8px; font-size: 2.25rem; letter-spacing: 0; }
+      h2 { margin-top: 32px; font-size: 1.15rem; }
+      p { line-height: 1.55; color: #4b5563; }
+      table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #ffffff; }
+      th, td { padding: 12px; border-bottom: 1px solid #d8dee8; text-align: left; vertical-align: top; }
+      th { color: #1f2937; font-size: 0.85rem; text-transform: uppercase; }
+      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      a { color: #075985; }
+      .status { display: inline-flex; gap: 8px; align-items: center; font-weight: 600; }
+      .dot { width: 10px; height: 10px; border-radius: 50%; background: #16a34a; }
+      @media (prefers-color-scheme: dark) {
+        :root { background: #101622; color: #f8fafc; }
+        p { color: #cbd5e1; }
+        table { background: #172033; }
+        th, td { border-bottom-color: #334155; }
+        th { color: #e2e8f0; }
+        a { color: #7dd3fc; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>homelab-functions</h1>
+      <p>Notification and homelab API service for stable reusable actions.</p>
+      <p class="status"><span class="dot"></span> Healthy when <a href="/health">/health</a> returns <code>status: ok</code>.</p>
+      <h2>Auth</h2>
+      <p>Protected endpoints require <code>Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN</code>. This docs page does not store tokens or run authenticated calls.</p>
+      <h2>API Endpoints</h2>
+      <table>
+        <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Auth</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td><a href="/health"><code>/health</code></a></td><td>Machine-readable health check.</td><td>None</td></tr>
+          <tr><td><code>POST</code></td><td><code>/v1/notify/joe</code></td><td>Send a mobile notification to Joe.</td><td>Bearer token</td></tr>
+          <tr><td><code>POST</code></td><td><code>/v1/notify/jess</code></td><td>Send a mobile notification to Jess.</td><td>Bearer token</td></tr>
+          <tr><td><code>GET</code></td><td><code>/v1/notifications</code></td><td>List notification records.</td><td>Bearer token</td></tr>
+          <tr><td><code>POST</code></td><td><code>/v1/notifications/actions</code></td><td>Record mobile notification actions.</td><td>Bearer token</td></tr>
+          <tr><td><code>POST</code></td><td><code>/v1/workflow-reports</code></td><td>Record workflow reports.</td><td>Bearer token</td></tr>
+          <tr><td><code>GET</code></td><td><code>/v1/workflow-reports</code></td><td>List workflow reports.</td><td>Bearer token</td></tr>
+          <tr><td><code>GET</code></td><td><code>/v1/workflow-reports/{id}</code></td><td>Fetch one workflow report.</td><td>Bearer token</td></tr>
+        </tbody>
+      </table>
+      <h2>Machine Schema</h2>
+      <p><a href="/openapi.json">OpenAPI JSON</a></p>
+    </main>
+  </body>
+</html>
+"""
+
+
 CONFIG_KEY = web.AppKey("config", Config)
 HA_CLIENT_KEY = web.AppKey("ha_client", HomeAssistantClient)
 LEDGER_KEY = web.AppKey("notification_ledger", NotificationLedger)
@@ -342,6 +594,8 @@ def create_app(
         )
         app.on_startup.append(start_action_recorder)
         app.on_cleanup.append(stop_action_recorder)
+    app.router.add_get("/docs", docs)
+    app.router.add_get("/openapi.json", openapi)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/notify/joe", notify_joe)
     app.router.add_post("/v1/notify/jess", notify_jess)
@@ -370,6 +624,14 @@ async def stop_action_recorder(app: web.Application) -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+async def docs(_request: web.Request) -> web.Response:
+    return web.Response(text=service_docs_html(), content_type="text/html")
+
+
+async def openapi(_request: web.Request) -> web.Response:
+    return web.json_response(service_openapi())
 
 
 async def health(request: web.Request) -> web.Response:
