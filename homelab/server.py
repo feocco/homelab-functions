@@ -305,7 +305,14 @@ def build_service_data(notification: dict[str, Any]) -> dict[str, Any]:
         "title": notification["title"],
         "message": notification["message"],
     }
-    data: dict[str, Any] = {}
+    # Android Companion delivers via FCM. Default (normal) priority can be
+    # deferred under Doze — e.g. no buzz until the screen turns on / unlock.
+    # ttl=0 + priority=high forces immediate wake/delivery for every notify.
+    # Docs: https://companion.home-assistant.io/docs/notifications/critical-notifications/
+    data: dict[str, Any] = {
+        "ttl": 0,
+        "priority": "high",
+    }
 
     for field in ("tag", "group"):
         value = notification.get(field)
@@ -324,9 +331,7 @@ def build_service_data(notification: dict[str, Any]) -> dict[str, Any]:
             for button in buttons
         ]
 
-    if data:
-        service_data["data"] = data
-
+    service_data["data"] = data
     return service_data
 
 
