@@ -68,6 +68,8 @@ class ValidationTests(unittest.TestCase):
                 "title": "Plant status",
                 "message": "Ficus needs water.",
                 "data": {
+                    "ttl": 0,
+                    "priority": "high",
                     "tag": "plant-ficus",
                     "group": "plant-monitor",
                     "url": "/lovelace/plants",
@@ -318,7 +320,7 @@ class AppTests(AioHTTPTestCase):
             {
                 "title": "Title",
                 "message": "Body",
-                "data": {"tag": "test"},
+                "data": {"ttl": 0, "priority": "high", "tag": "test"},
             },
         )
         self.assertEqual(self.fake_ha.notify_service, "notify.mobile_app_pixel")
@@ -340,7 +342,7 @@ class AppTests(AioHTTPTestCase):
             {
                 "title": "Dinner plan",
                 "message": "Please review.",
-                "data": {"group": "mealie-planner"},
+                "data": {"ttl": 0, "priority": "high", "group": "mealie-planner"},
             },
         )
 
