@@ -14,6 +14,17 @@
 - Use `homelab.HomeAssistantWebSocketClient` for new Python Home Assistant
   integrations.
 
+## Access Parity
+
+- Any protected `/v1` action must be declared in the `AccessVector` registry in
+  `homelab/access.py`.
+- That action must have a matching HTTP route and OpenAPI operation, a
+  `HomelabFunctionsClient` method, an MCP tool, a plugin skill entry, and
+  behavior-level coverage in `tests/test_access_vector_parity.py`.
+- `/health`, `/docs`, and `/openapi.json` stay public and outside the registry.
+- Do not add generic Home Assistant state, event, or service-call operations
+  to the registry. Use `homelab.HomeAssistantWebSocketClient` for that work.
+
 ## Public API Documentation
 
 - Public helpers intended for reuse across repos should have concise docstrings.

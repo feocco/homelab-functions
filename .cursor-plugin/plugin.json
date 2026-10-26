@@ -1,0 +1,32 @@
+{
+  "name": "homelab-functions",
+  "displayName": "Homelab Functions",
+  "version": "0.1.0",
+  "description": "Named homelab broker actions for notifications, catalogs, and workflow reports.",
+  "author": {
+    "name": "homelab-functions"
+  },
+  "keywords": [
+    "homelab",
+    "notifications",
+    "workflow-reports",
+    "mcp"
+  ],
+  "skills": "./skills/",
+  "variables": {
+    "type": "object",
+    "properties": {
+      "HOMELAB_FUNCTIONS_URL": {
+        "type": "string",
+        "description": "Base URL of the homelab-functions service.",
+        "default": "http://127.0.0.1:8091"
+      },
+      "HOMELAB_FUNCTIONS_TOKEN": {
+        "type": "string",
+        "description": "Bearer token for protected homelab-functions actions."
+      }
+    },
+    "required": ["HOMELAB_FUNCTIONS_TOKEN"]
+  },
+  "mcpServers": "./mcp.json"
+}

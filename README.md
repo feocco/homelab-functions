@@ -38,6 +38,47 @@ homelab.notify_jess(
 Jess notifications use the same broker and payload shape as Joe notifications,
 but route to the configured `HA_NOTIFY_JESS_SERVICE`.
 
+## Python client
+
+`HomelabFunctionsClient` calls every protected action. The constructor takes
+the service URL, bearer token, and timeout. The action list is
+`homelab.access.ACCESS_VECTOR`.
+
+```python
+from homelab import HomelabFunctionsClient
+
+client = HomelabFunctionsClient(
+    "http://127.0.0.1:8091",
+    token="replace_me",
+    timeout=10,
+)
+client.notify_joe("Plant status", "Ficus needs water.")
+catalog = client.get_service_catalog()
+targets = client.get_smoke_signal_targets()
+```
+
+The module-level helpers, including `notify_joe`, `get_service_catalog`,
+`get_smoke_signal_targets`, `list_workflow_reports`, and `get_workflow_report`,
+use the same client. When you omit the URL or token, they read
+`HOMELAB_FUNCTIONS_URL` and `HOMELAB_FUNCTIONS_TOKEN`.
+
+## MCP and the Cursor plugin
+
+This repo includes a Cursor plugin. `.cursor-plugin/plugin.json` points at
+`mcp.json` and `skills/`. The plugin starts a stdio MCP server with
+`python3 -m homelab.mcp_server`. The `homelab-functions-mcp` command starts
+that same server.
+
+`.cursor-plugin/plugin.json` declares `HOMELAB_FUNCTIONS_URL` with default
+`http://127.0.0.1:8091` and requires `HOMELAB_FUNCTIONS_TOKEN`. `mcp.json`
+passes those values as `${HOMELAB_FUNCTIONS_URL}` and
+`${HOMELAB_FUNCTIONS_TOKEN}`, and sets the server working directory to
+`${CURSOR_PLUGIN_ROOT}`. The server does not embed a token. Its tools are
+the protected actions in `homelab.access.ACCESS_VECTOR`.
+
+Use `homelab.HomeAssistantWebSocketClient` for Home Assistant state, events,
+and service calls. Do not add those operations to the broker.
+
 ## Home Assistant Client Helper
 
 For services that need Home Assistant state or events, connect directly to Home
@@ -117,18 +158,15 @@ proxy. Add named server endpoints only for stable reusable actions.
 
 ## Service API
 
+`homelab.access.ACCESS_VECTOR` is the registry of protected `/v1` actions.
+HTTP routes, OpenAPI operation ids, `HomelabFunctionsClient`, and the MCP
+tools all come from that registry.
+
+These routes stay public and are not in the registry.
+
 - `GET /health`
 - `GET /docs`
 - `GET /openapi.json`
-- `POST /v1/notify/joe`
-- `POST /v1/notify/jess`
-- `GET /v1/notifications`
-- `POST /v1/notifications/actions`
-- `GET /v1/catalog/services`
-- `GET /v1/catalog/smoke-signal-targets`
-- `POST /v1/workflow-reports`
-- `GET /v1/workflow-reports`
-- `GET /v1/workflow-reports/{id}`
 
 Protected endpoints require:
 
@@ -235,7 +273,12 @@ router.register("WORKFLOW_REPORT", handle_report)
 Workflow slugs are caller-owned strings. Prefer stable kebab-case names such as
 `cat-food-monitor`, but `homelab-functions` does not keep a workflow registry.
 
-Recent reports can be inspected through the service API:
+Recent reports can be inspected with the client or the service API:
+
+```python
+reports = homelab.list_workflow_reports(workflow="cat-food-monitor", limit=20)
+report = homelab.get_workflow_report(reports["reports"][0]["id"])
+```
 
 ```bash
 curl -H "Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN" \
