@@ -19,6 +19,7 @@ test = [
 
 [project.scripts]
 homelab-functions = "homelab.server:main"
+homelab-functions-mcp = "homelab.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["homelab*"]

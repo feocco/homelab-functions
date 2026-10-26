@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from typing import Any
-from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+
+from .access import ACCESS_VECTOR
 
 
 DEFAULT_FUNCTIONS_URL = "http://127.0.0.1:8091"
 WORKFLOW_REPORT_ACTION_PREFIX = "WORKFLOW_REPORT"
+_BODY_METHODS = {"POST", "PUT", "PATCH"}
 
 
 class HomelabFunctionsError(RuntimeError):
@@ -27,121 +31,282 @@ class HomelabFunctionsError(RuntimeError):
         self.detail = detail
 
 
-def notify_joe(
-    title: str,
-    message: str,
-    *,
-    tag: str | None = None,
-    group: str | None = None,
-    url: str | None = None,
-    buttons: list[dict[str, Any]] | None = None,
-    service_url: str | None = None,
-    token: str | None = None,
-    timeout: float = 10,
-) -> dict[str, Any]:
-    return _notify_person(
-        "joe",
-        title,
-        message,
-        tag=tag,
-        group=group,
-        url=url,
-        buttons=buttons,
-        service_url=service_url,
-        token=token,
-        timeout=timeout,
+class HomelabFunctionsClient:
+    """Synchronous client for protected homelab-functions actions.
+
+    Pass the service URL, bearer token, and timeout to the constructor, then
+    call the method for the action you need.
+
+    ```python
+    from homelab import HomelabFunctionsClient
+
+    client = HomelabFunctionsClient(
+        "http://127.0.0.1:8091",
+        token="replace_me",
+        timeout=10,
     )
+    client.notify_joe("Plant status", "Ficus needs water.")
+    ```
+    """
 
+    def __init__(
+        self,
+        service_url: str | None = None,
+        token: str | None = None,
+        timeout: float = 10,
+    ) -> None:
+        resolved_url = service_url or os.environ.get("HOMELAB_FUNCTIONS_URL") or DEFAULT_FUNCTIONS_URL
+        resolved_token = token if token is not None else os.environ.get("HOMELAB_FUNCTIONS_TOKEN")
+        self.service_url = resolved_url.rstrip("/")
+        self.token = resolved_token or ""
+        self.timeout = timeout
 
-def notify_jess(
-    title: str,
-    message: str,
-    *,
-    tag: str | None = None,
-    group: str | None = None,
-    url: str | None = None,
-    buttons: list[dict[str, Any]] | None = None,
-    service_url: str | None = None,
-    token: str | None = None,
-    timeout: float = 10,
-) -> dict[str, Any]:
-    return _notify_person(
-        "jess",
-        title,
-        message,
-        tag=tag,
-        group=group,
-        url=url,
-        buttons=buttons,
-        service_url=service_url,
-        token=token,
-        timeout=timeout,
-    )
+    def notify_joe(
+        self,
+        title: str,
+        message: str,
+        *,
+        tag: str | None = None,
+        group: str | None = None,
+        url: str | None = None,
+        buttons: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Send a mobile notification to Joe."""
 
+        return self.call(
+            "notify_joe",
+            {
+                "title": title,
+                "message": message,
+                "tag": tag,
+                "group": group,
+                "url": url,
+                "buttons": buttons,
+            },
+        )
 
-def _notify_person(
-    recipient: str,
-    title: str,
-    message: str,
-    *,
-    tag: str | None,
-    group: str | None,
-    url: str | None,
-    buttons: list[dict[str, Any]] | None,
-    service_url: str | None,
-    token: str | None,
-    timeout: float,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "title": title,
-        "message": message,
-    }
-    if tag is not None:
-        payload["tag"] = tag
-    if group is not None:
-        payload["group"] = group
-    if url is not None:
-        payload["url"] = url
-    if buttons is not None:
-        payload["buttons"] = buttons
+    def notify_jess(
+        self,
+        title: str,
+        message: str,
+        *,
+        tag: str | None = None,
+        group: str | None = None,
+        url: str | None = None,
+        buttons: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Send a mobile notification to Jess."""
 
-    return _post_json(
-        f"/v1/notify/{recipient}",
-        payload,
-        service_url=service_url,
-        token=token,
-        timeout=timeout,
-    )
+        return self.call(
+            "notify_jess",
+            {
+                "title": title,
+                "message": message,
+                "tag": tag,
+                "group": group,
+                "url": url,
+                "buttons": buttons,
+            },
+        )
 
+    def list_notifications(
+        self,
+        *,
+        limit: int = ACCESS_VECTOR.get("list_notifications").parameter("limit").default,
+        group: str | None = None,
+        tag: str | None = None,
+    ) -> dict[str, Any]:
+        """List notification records from the shared ledger."""
 
-def record_notification_action(
-    action: str,
-    *,
-    tag: str | None = None,
-    group: str | None = None,
-    reply_text: str | None = None,
-    event: dict[str, Any] | None = None,
-    service_url: str | None = None,
-    token: str | None = None,
-    timeout: float = 10,
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {"action": action}
-    if tag is not None:
-        payload["tag"] = tag
-    if group is not None:
-        payload["group"] = group
-    if reply_text is not None:
-        payload["reply_text"] = reply_text
-    if event is not None:
-        payload["event"] = event
+        return self.call(
+            "list_notifications",
+            {"limit": limit, "group": group, "tag": tag},
+        )
 
-    return _post_json(
-        "/v1/notifications/actions",
-        payload,
-        service_url=service_url,
-        token=token,
-        timeout=timeout,
-    )
+    def record_notification_action(
+        self,
+        action: str,
+        *,
+        tag: str | None = None,
+        group: str | None = None,
+        reply_text: str | None = None,
+        event: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record a mobile notification action against the latest matching notification."""
+
+        return self.call(
+            "record_notification_action",
+            {
+                "action": action,
+                "tag": tag,
+                "group": group,
+                "reply_text": reply_text,
+                "event": event,
+            },
+        )
+
+    def get_service_catalog(self) -> dict[str, Any]:
+        """Return the service catalog JSON generated by homelab-config."""
+
+        return self.call("get_service_catalog")
+
+    def get_smoke_signal_targets(self) -> dict[str, Any]:
+        """Return the Smoke Signal target list generated by homelab-config."""
+
+        return self.call("get_smoke_signal_targets")
+
+    def record_workflow_report(
+        self,
+        workflow_slug: str,
+        summary: str,
+        *,
+        source: str | None = None,
+        notification_id: int | None = None,
+        event: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Record a workflow report for later investigation."""
+
+        return self.call(
+            "record_workflow_report",
+            {
+                "workflow_slug": workflow_slug,
+                "summary": summary,
+                "source": source,
+                "notification_id": notification_id,
+                "event": event,
+            },
+        )
+
+    def list_workflow_reports(
+        self,
+        *,
+        limit: int = ACCESS_VECTOR.get("list_workflow_reports").parameter("limit").default,
+        workflow: str | None = None,
+    ) -> dict[str, Any]:
+        """List workflow reports from the shared ledger."""
+
+        return self.call(
+            "list_workflow_reports",
+            {"limit": limit, "workflow": workflow},
+        )
+
+    def get_workflow_report(self, report_id: int) -> dict[str, Any]:
+        """Get one workflow report by id."""
+
+        return self.call("get_workflow_report", {"report_id": report_id})
+
+    def call(self, operation_id: str, arguments: Mapping[str, Any] | None = None) -> Any:
+        """Call one registry operation by id.
+
+        Named methods are the usual API. This entry point is for callers that
+        already have an operation id, including the MCP server.
+        """
+
+        try:
+            operation = ACCESS_VECTOR.get(operation_id)
+        except KeyError:
+            raise HomelabFunctionsError(
+                f"Unknown operation: {operation_id}",
+                code="unknown_operation",
+            ) from None
+
+        if not self.token:
+            raise HomelabFunctionsError(
+                "HOMELAB_FUNCTIONS_TOKEN is required to call homelab-functions",
+                code="missing_client_token",
+            )
+
+        supplied = dict(arguments or {})
+        unknown = sorted(set(supplied) - {parameter.name for parameter in operation.parameters})
+        if unknown:
+            raise HomelabFunctionsError(
+                f"Unknown arguments: {', '.join(unknown)}",
+                code="unknown_argument",
+            )
+
+        body: dict[str, Any] = {}
+        query: list[tuple[str, str]] = []
+        path_values: dict[str, str] = {}
+        for parameter in operation.parameters:
+            if parameter.name in supplied and supplied[parameter.name] is not None:
+                value = supplied[parameter.name]
+            elif parameter.required:
+                raise HomelabFunctionsError(
+                    f"{parameter.name} is required",
+                    code="missing_argument",
+                    detail=parameter.name,
+                )
+            elif parameter.has_default():
+                value = parameter.default
+            else:
+                continue
+            if parameter.location == "body":
+                body[parameter.name] = value
+            elif parameter.location == "query":
+                query.append((parameter.name, str(value)))
+            else:
+                path_values[parameter.name] = str(value)
+
+        rendered = operation.path
+        for name, value in path_values.items():
+            needle = "{" + name + "}"
+            if needle not in rendered:
+                raise HomelabFunctionsError(
+                    f"Path template for {operation.operation_id} has no {needle}",
+                    code="invalid_path",
+                    detail=name,
+                )
+            rendered = rendered.replace(needle, quote(value, safe=""))
+        if "{" in rendered or "}" in rendered:
+            raise HomelabFunctionsError(
+                f"Unresolved path template for {operation.operation_id}",
+                code="invalid_path",
+            )
+
+        url = f"{self.service_url}{rendered}"
+        if query:
+            url = f"{url}?{urlencode(query)}"
+        data = json.dumps(body).encode("utf-8") if operation.method in _BODY_METHODS else None
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+        }
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request(url, data=data, headers=headers, method=operation.method)
+        return self._read_response(request)
+
+    def _read_response(self, request: Request) -> Any:
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read().decode("utf-8")
+        except HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            error_payload = _parse_error_payload(body_text)
+            raise HomelabFunctionsError(
+                error_payload.get("message") or f"homelab-functions returned HTTP {exc.code}",
+                status=exc.code,
+                code=error_payload.get("code"),
+                detail=error_payload.get("detail"),
+            ) from exc
+        except URLError as exc:
+            raise HomelabFunctionsError(
+                f"Could not reach homelab-functions at {self.service_url}: {exc.reason}",
+                code="service_unreachable",
+            ) from exc
+        except TimeoutError as exc:
+            raise HomelabFunctionsError(
+                f"Timed out calling homelab-functions at {self.service_url}",
+                code="service_timeout",
+            ) from exc
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HomelabFunctionsError(
+                "homelab-functions returned a non-JSON response",
+                code="invalid_response",
+            ) from exc
 
 
 def workflow_report_button(workflow_slug: str) -> dict[str, str]:
@@ -159,6 +324,76 @@ def workflow_report_button(workflow_slug: str) -> dict[str, str]:
     }
 
 
+def notify_joe(
+    title: str,
+    message: str,
+    *,
+    tag: str | None = None,
+    group: str | None = None,
+    url: str | None = None,
+    buttons: list[dict[str, Any]] | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Send a mobile notification to Joe."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).notify_joe(
+        title,
+        message,
+        tag=tag,
+        group=group,
+        url=url,
+        buttons=buttons,
+    )
+
+
+def notify_jess(
+    title: str,
+    message: str,
+    *,
+    tag: str | None = None,
+    group: str | None = None,
+    url: str | None = None,
+    buttons: list[dict[str, Any]] | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Send a mobile notification to Jess."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).notify_jess(
+        title,
+        message,
+        tag=tag,
+        group=group,
+        url=url,
+        buttons=buttons,
+    )
+
+
+def record_notification_action(
+    action: str,
+    *,
+    tag: str | None = None,
+    group: str | None = None,
+    reply_text: str | None = None,
+    event: dict[str, Any] | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Record a mobile notification action against the latest matching notification."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).record_notification_action(
+        action,
+        tag=tag,
+        group=group,
+        reply_text=reply_text,
+        event=event,
+    )
+
+
 def record_workflow_report(
     workflow_slug: str,
     summary: str,
@@ -172,146 +407,81 @@ def record_workflow_report(
 ) -> dict[str, Any]:
     """Record a human-submitted workflow incident for later investigation."""
 
-    payload: dict[str, Any] = {
-        "workflow_slug": workflow_slug,
-        "summary": summary,
-    }
-    if source is not None:
-        payload["source"] = source
-    if notification_id is not None:
-        payload["notification_id"] = notification_id
-    if event is not None:
-        payload["event"] = event
-
-    return _post_json(
-        "/v1/workflow-reports",
-        payload,
-        service_url=service_url,
-        token=token,
-        timeout=timeout,
+    return HomelabFunctionsClient(service_url, token, timeout).record_workflow_report(
+        workflow_slug,
+        summary,
+        source=source,
+        notification_id=notification_id,
+        event=event,
     )
 
 
 def list_notifications(
     *,
+    limit: int = ACCESS_VECTOR.get("list_notifications").parameter("limit").default,
     group: str | None = None,
     tag: str | None = None,
-    limit: int = 50,
     service_url: str | None = None,
     token: str | None = None,
     timeout: float = 10,
 ) -> dict[str, Any]:
-    query: dict[str, str] = {"limit": str(limit)}
-    if group is not None:
-        query["group"] = group
-    if tag is not None:
-        query["tag"] = tag
-    return _get_json(
-        f"/v1/notifications?{urlencode(query)}",
-        service_url=service_url,
-        token=token,
-        timeout=timeout,
+    """List notification records from the shared ledger."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).list_notifications(
+        limit=limit,
+        group=group,
+        tag=tag,
     )
 
 
-def _post_json(
-    path: str,
-    payload: dict[str, Any],
+def get_service_catalog(
     *,
-    service_url: str | None,
-    token: str | None,
-    timeout: float,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
 ) -> dict[str, Any]:
-    base_url = (service_url or os.environ.get("HOMELAB_FUNCTIONS_URL") or DEFAULT_FUNCTIONS_URL).rstrip("/")
-    auth_token = token if token is not None else os.environ.get("HOMELAB_FUNCTIONS_TOKEN")
-    if not auth_token:
-        raise HomelabFunctionsError(
-            "HOMELAB_FUNCTIONS_TOKEN is required to call homelab-functions",
-            code="missing_client_token",
-        )
+    """Return the service catalog JSON generated by homelab-config."""
 
-    body = json.dumps(payload).encode("utf-8")
-    request = Request(
-        f"{base_url}{path}",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {auth_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        error_payload = _parse_error_payload(body_text)
-        raise HomelabFunctionsError(
-            error_payload.get("message") or f"homelab-functions returned HTTP {exc.code}",
-            status=exc.code,
-            code=error_payload.get("code"),
-            detail=error_payload.get("detail"),
-        ) from exc
-    except URLError as exc:
-        raise HomelabFunctionsError(
-            f"Could not reach homelab-functions at {base_url}: {exc.reason}",
-            code="service_unreachable",
-        ) from exc
-    except TimeoutError as exc:
-        raise HomelabFunctionsError(
-            f"Timed out calling homelab-functions at {base_url}",
-            code="service_timeout",
-        ) from exc
+    return HomelabFunctionsClient(service_url, token, timeout).get_service_catalog()
 
 
-def _get_json(
-    path: str,
+def get_smoke_signal_targets(
     *,
-    service_url: str | None,
-    token: str | None,
-    timeout: float,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
 ) -> dict[str, Any]:
-    base_url = (service_url or os.environ.get("HOMELAB_FUNCTIONS_URL") or DEFAULT_FUNCTIONS_URL).rstrip("/")
-    auth_token = token if token is not None else os.environ.get("HOMELAB_FUNCTIONS_TOKEN")
-    if not auth_token:
-        raise HomelabFunctionsError(
-            "HOMELAB_FUNCTIONS_TOKEN is required to call homelab-functions",
-            code="missing_client_token",
-        )
+    """Return the Smoke Signal target list generated by homelab-config."""
 
-    request = Request(
-        f"{base_url}{path}",
-        headers={
-            "Authorization": f"Bearer {auth_token}",
-            "Accept": "application/json",
-        },
-        method="GET",
+    return HomelabFunctionsClient(service_url, token, timeout).get_smoke_signal_targets()
+
+
+def list_workflow_reports(
+    *,
+    limit: int = ACCESS_VECTOR.get("list_workflow_reports").parameter("limit").default,
+    workflow: str | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """List workflow reports from the shared ledger."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).list_workflow_reports(
+        limit=limit,
+        workflow=workflow,
     )
 
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        body_text = exc.read().decode("utf-8", errors="replace")
-        error_payload = _parse_error_payload(body_text)
-        raise HomelabFunctionsError(
-            error_payload.get("message") or f"homelab-functions returned HTTP {exc.code}",
-            status=exc.code,
-            code=error_payload.get("code"),
-            detail=error_payload.get("detail"),
-        ) from exc
-    except URLError as exc:
-        raise HomelabFunctionsError(
-            f"Could not reach homelab-functions at {base_url}: {exc.reason}",
-            code="service_unreachable",
-        ) from exc
-    except TimeoutError as exc:
-        raise HomelabFunctionsError(
-            f"Timed out calling homelab-functions at {base_url}",
-            code="service_timeout",
-        ) from exc
+
+def get_workflow_report(
+    report_id: int,
+    *,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Get one workflow report by id."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).get_workflow_report(report_id)
 
 
 def _parse_error_payload(body: str) -> dict[str, str]:

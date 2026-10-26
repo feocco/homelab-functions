@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import html
 import json
 import logging
 import os
 import re
+from functools import wraps
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any
@@ -13,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
+from .access import ACCESS_VECTOR, AccessOperation, AccessParameter
 from .action_recorder import NotificationActionRecorder
 from .home_assistant import HomeAssistantConfig
 from .notification_ledger import NotificationLedger
@@ -335,24 +338,94 @@ def build_service_data(notification: dict[str, Any]) -> dict[str, Any]:
     return service_data
 
 
-def service_openapi() -> dict[str, Any]:
-    bearer_required = [{"bearerAuth": []}]
-    error_response_schema = {
-        "type": "object",
-        "required": ["error"],
-        "properties": {
-            "error": {
-                "type": "object",
-                "required": ["code", "message"],
-                "properties": {
-                    "code": {"type": "string"},
-                    "message": {"type": "string"},
-                    "detail": {"type": "string"},
-                },
-            }
+def _error_content(description: str) -> dict[str, Any]:
+    return {
+        "description": description,
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}
         },
     }
-    return {
+
+
+def _openapi_parameter(parameter: AccessParameter) -> dict[str, Any]:
+    documented: dict[str, Any] = {
+        "name": parameter.name,
+        "in": parameter.location,
+    }
+    if parameter.required:
+        documented["required"] = True
+    documented["schema"] = parameter.schema_with_default()
+    return documented
+
+
+def _component_schemas() -> dict[str, Any]:
+    schemas: dict[str, Any] = {
+        "ErrorResponse": {
+            "type": "object",
+            "required": ["error"],
+            "properties": {
+                "error": {
+                    "type": "object",
+                    "required": ["code", "message"],
+                    "properties": {
+                        "code": {"type": "string"},
+                        "message": {"type": "string"},
+                        "detail": {"type": "string"},
+                    },
+                }
+            },
+        }
+    }
+    schemas.update(ACCESS_VECTOR.component_schemas())
+    return schemas
+
+
+def _openapi_responses(operation: AccessOperation) -> dict[str, Any]:
+    responses: dict[str, Any] = {"200": {"description": operation.summary}}
+    for error in operation.errors:
+        responses[error.status] = _error_content(error.description)
+    return responses
+
+
+def _openapi_operation(operation: AccessOperation) -> dict[str, Any]:
+    located = [parameter for parameter in operation.parameters if parameter.location != "body"]
+    documented: dict[str, Any] = {
+        "operationId": operation.operation_id,
+        "summary": operation.summary,
+        "description": operation.description,
+        "security": [{"bearerAuth": []}],
+    }
+    if located:
+        documented["parameters"] = [_openapi_parameter(parameter) for parameter in located]
+    if operation.body_parameters():
+        if operation.body_component:
+            schema: dict[str, Any] = {"$ref": f"#/components/schemas/{operation.body_component}"}
+        else:
+            schema = operation.body_object_schema()
+        documented["requestBody"] = {
+            "required": True,
+            "content": {"application/json": {"schema": schema}},
+        }
+    documented["responses"] = _openapi_responses(operation)
+    return documented
+
+
+def _protected_doc_rows() -> str:
+    rows: list[str] = []
+    for operation in ACCESS_VECTOR:
+        rows.append(
+            "<tr>"
+            f"<td><code>{html.escape(operation.method)}</code></td>"
+            f"<td><code>{html.escape(operation.path)}</code></td>"
+            f"<td>{html.escape(operation.summary)}</td>"
+            "<td>Bearer token</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def service_openapi() -> dict[str, Any]:
+    document: dict[str, Any] = {
         "openapi": "3.1.0",
         "info": {
             "title": "homelab-functions",
@@ -367,36 +440,7 @@ def service_openapi() -> dict[str, Any]:
                     "description": "Use HOMELAB_FUNCTIONS_TOKEN. Browser docs intentionally do not store tokens.",
                 }
             },
-            "schemas": {
-                "ErrorResponse": error_response_schema,
-                "NotificationRequest": {
-                    "type": "object",
-                    "required": ["title", "message"],
-                    "properties": {
-                        "title": {"type": "string"},
-                        "message": {"type": "string"},
-                        "tag": {"type": "string"},
-                        "group": {"type": "string"},
-                        "url": {"type": "string"},
-                        "buttons": {
-                            "type": "array",
-                            "maxItems": MAX_BUTTONS,
-                            "items": {"type": "object"},
-                        },
-                    },
-                },
-                "WorkflowReportRequest": {
-                    "type": "object",
-                    "required": ["workflow_slug", "summary"],
-                    "properties": {
-                        "workflow_slug": {"type": "string"},
-                        "summary": {"type": "string"},
-                        "source": {"type": "string"},
-                        "notification_id": {"type": "integer"},
-                        "event": {"type": "object"},
-                    },
-                },
-            },
+            "schemas": _component_schemas(),
         },
         "paths": {
             "/health": {
@@ -410,142 +454,16 @@ def service_openapi() -> dict[str, Any]:
                     },
                 }
             },
-            "/v1/notify/joe": {
-                "post": {
-                    "summary": "Send a mobile notification to Joe",
-                    "security": bearer_required,
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {"schema": {"$ref": "#/components/schemas/NotificationRequest"}}
-                        },
-                    },
-                    "responses": {
-                        "200": {"description": "Notification sent"},
-                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                }
-            },
-            "/v1/notify/jess": {
-                "post": {
-                    "summary": "Send a mobile notification to Jess",
-                    "security": bearer_required,
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {"schema": {"$ref": "#/components/schemas/NotificationRequest"}}
-                        },
-                    },
-                    "responses": {
-                        "200": {"description": "Notification sent"},
-                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                }
-            },
-            "/v1/notifications": {
-                "get": {
-                    "summary": "List notification records",
-                    "security": bearer_required,
-                    "parameters": [
-                        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
-                        {"name": "group", "in": "query", "schema": {"type": "string"}},
-                        {"name": "tag", "in": "query", "schema": {"type": "string"}},
-                    ],
-                    "responses": {
-                        "200": {"description": "Notification records"},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                }
-            },
-            "/v1/notifications/actions": {
-                "post": {
-                    "summary": "Record a mobile notification action",
-                    "security": bearer_required,
-                    "requestBody": {
-                        "required": True,
-                        "content": {"application/json": {"schema": {"type": "object"}}},
-                    },
-                    "responses": {
-                        "200": {"description": "Recorded action"},
-                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                }
-            },
-            "/v1/catalog/services": {
-                "get": {
-                    "summary": "Return the generated homelab service catalog",
-                    "security": bearer_required,
-                    "responses": {
-                        "200": {"description": "Generated service catalog"},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                        "503": {"description": "Catalog file unavailable", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                }
-            },
-            "/v1/catalog/smoke-signal-targets": {
-                "get": {
-                    "summary": "Return the generated Smoke Signal target list",
-                    "security": bearer_required,
-                    "responses": {
-                        "200": {"description": "Generated Smoke Signal targets"},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                        "503": {"description": "Catalog file unavailable", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                }
-            },
-            "/v1/workflow-reports": {
-                "post": {
-                    "summary": "Record a workflow report",
-                    "security": bearer_required,
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {"schema": {"$ref": "#/components/schemas/WorkflowReportRequest"}}
-                        },
-                    },
-                    "responses": {
-                        "200": {"description": "Recorded workflow report"},
-                        "400": {"description": "Invalid request", "content": {"application/json": {"schema": error_response_schema}}},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                },
-                "get": {
-                    "summary": "List workflow reports",
-                    "security": bearer_required,
-                    "parameters": [
-                        {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 50}},
-                        {"name": "workflow", "in": "query", "schema": {"type": "string"}},
-                    ],
-                    "responses": {
-                        "200": {"description": "Workflow report records"},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                },
-            },
-            "/v1/workflow-reports/{report_id}": {
-                "get": {
-                    "summary": "Get one workflow report",
-                    "security": bearer_required,
-                    "parameters": [
-                        {"name": "report_id", "in": "path", "required": True, "schema": {"type": "integer"}}
-                    ],
-                    "responses": {
-                        "200": {"description": "Workflow report"},
-                        "400": {"description": "Invalid report id", "content": {"application/json": {"schema": error_response_schema}}},
-                        "401": {"description": "Missing or invalid token", "content": {"application/json": {"schema": error_response_schema}}},
-                        "404": {"description": "Report not found", "content": {"application/json": {"schema": error_response_schema}}},
-                    },
-                }
-            },
         },
     }
+    for operation in ACCESS_VECTOR:
+        path_item = document["paths"].setdefault(operation.path, {})
+        path_item[operation.method.lower()] = _openapi_operation(operation)
+    return document
 
 
 def service_docs_html() -> str:
-    return """<!doctype html>
+    document = """<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8">
@@ -592,15 +510,7 @@ def service_docs_html() -> str:
         <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Auth</th></tr></thead>
         <tbody>
           <tr><td><code>GET</code></td><td><a href="/health"><code>/health</code></a></td><td>Machine-readable health check.</td><td>None</td></tr>
-          <tr><td><code>POST</code></td><td><code>/v1/notify/joe</code></td><td>Send a mobile notification to Joe.</td><td>Bearer token</td></tr>
-          <tr><td><code>POST</code></td><td><code>/v1/notify/jess</code></td><td>Send a mobile notification to Jess.</td><td>Bearer token</td></tr>
-          <tr><td><code>GET</code></td><td><code>/v1/notifications</code></td><td>List notification records.</td><td>Bearer token</td></tr>
-          <tr><td><code>POST</code></td><td><code>/v1/notifications/actions</code></td><td>Record mobile notification actions.</td><td>Bearer token</td></tr>
-          <tr><td><code>GET</code></td><td><code>/v1/catalog/services</code></td><td>Return the generated homelab service catalog.</td><td>Bearer token</td></tr>
-          <tr><td><code>GET</code></td><td><code>/v1/catalog/smoke-signal-targets</code></td><td>Return the generated Smoke Signal target list.</td><td>Bearer token</td></tr>
-          <tr><td><code>POST</code></td><td><code>/v1/workflow-reports</code></td><td>Record workflow reports.</td><td>Bearer token</td></tr>
-          <tr><td><code>GET</code></td><td><code>/v1/workflow-reports</code></td><td>List workflow reports.</td><td>Bearer token</td></tr>
-          <tr><td><code>GET</code></td><td><code>/v1/workflow-reports/{id}</code></td><td>Fetch one workflow report.</td><td>Bearer token</td></tr>
+          <!--protected-routes-->
         </tbody>
       </table>
       <h2>Machine Schema</h2>
@@ -609,6 +519,7 @@ def service_docs_html() -> str:
   </body>
 </html>
 """
+    return document.replace("<!--protected-routes-->", _protected_doc_rows())
 
 
 CONFIG_KEY = web.AppKey("config", Config)
@@ -616,6 +527,51 @@ HA_CLIENT_KEY = web.AppKey("ha_client", HomeAssistantClient)
 LEDGER_KEY = web.AppKey("notification_ledger", NotificationLedger)
 ACTION_RECORDER_KEY = web.AppKey("notification_action_recorder", NotificationActionRecorder)
 ACTION_RECORDER_TASK_KEY = web.AppKey("notification_action_recorder_task", asyncio.Task[None])
+
+
+def _bearer_protected(handler):
+    @wraps(handler)
+    async def protected(request: web.Request) -> web.Response:
+        config = request.app[CONFIG_KEY]
+        if not authorized(request, config.homelab_functions_token):
+            return error_response(
+                HTTPStatus.UNAUTHORIZED,
+                "unauthorized",
+                "Invalid or missing bearer token",
+            )
+        return await handler(request)
+
+    return protected
+
+
+def _register_protected_routes(app: web.Application) -> None:
+    handlers = {
+        "notify_joe": notify_joe,
+        "notify_jess": notify_jess,
+        "list_notifications": list_notifications,
+        "record_notification_action": record_notification_action,
+        "get_service_catalog": catalog_services,
+        "get_smoke_signal_targets": smoke_signal_targets,
+        "record_workflow_report": record_workflow_report,
+        "list_workflow_reports": list_workflow_reports,
+        "get_workflow_report": get_workflow_report,
+    }
+    declared = {operation.operation_id for operation in ACCESS_VECTOR}
+    registered = set(handlers)
+    if registered != declared:
+        missing = ", ".join(sorted(declared - registered))
+        extra = ", ".join(sorted(registered - declared))
+        raise RuntimeError(
+            f"Protected handlers do not match AccessVector. missing=[{missing}] extra=[{extra}]"
+        )
+    for operation in ACCESS_VECTOR:
+        handler = _bearer_protected(handlers[operation.operation_id])
+        if operation.method == "GET":
+            app.router.add_get(operation.path, handler)
+        elif operation.method == "POST":
+            app.router.add_post(operation.path, handler)
+        else:
+            app.router.add_route(operation.method, operation.path, handler)
 
 
 def create_app(
@@ -641,15 +597,7 @@ def create_app(
     app.router.add_get("/docs", docs)
     app.router.add_get("/openapi.json", openapi)
     app.router.add_get("/health", health)
-    app.router.add_post("/v1/notify/joe", notify_joe)
-    app.router.add_post("/v1/notify/jess", notify_jess)
-    app.router.add_get("/v1/notifications", list_notifications)
-    app.router.add_post("/v1/notifications/actions", record_notification_action)
-    app.router.add_get("/v1/catalog/services", catalog_services)
-    app.router.add_get("/v1/catalog/smoke-signal-targets", smoke_signal_targets)
-    app.router.add_post("/v1/workflow-reports", record_workflow_report)
-    app.router.add_get("/v1/workflow-reports", list_workflow_reports)
-    app.router.add_get("/v1/workflow-reports/{report_id}", get_workflow_report)
+    _register_protected_routes(app)
     return app
 
 
@@ -715,10 +663,6 @@ async def notify_jess(request: web.Request) -> web.Response:
 
 
 async def notify_recipient(request: web.Request, notify_service: str) -> web.Response:
-    config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
     try:
         payload = await request.json()
         notification = validate_notification_payload(payload)
@@ -764,11 +708,10 @@ async def notify_recipient(request: web.Request, notify_service: str) -> web.Res
 
 
 async def list_notifications(request: web.Request) -> web.Response:
-    config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
-    limit = parse_limit(request.query.get("limit"))
+    limit = parse_limit(
+        request.query.get("limit"),
+        default=ACCESS_VECTOR.get("list_notifications").parameter("limit").default,
+    )
     notifications = request.app[LEDGER_KEY].list_notifications(
         limit=limit,
         group=optional_query_string(request.query.get("group")),
@@ -778,10 +721,6 @@ async def list_notifications(request: web.Request) -> web.Response:
 
 
 async def record_notification_action(request: web.Request) -> web.Response:
-    config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
     try:
         payload = await request.json()
         action_event = validate_notification_action_payload(payload)
@@ -799,17 +738,11 @@ async def record_notification_action(request: web.Request) -> web.Response:
 
 async def catalog_services(request: web.Request) -> web.Response:
     config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
     return catalog_response(config.homelab_catalog_path, "service catalog")
 
 
 async def smoke_signal_targets(request: web.Request) -> web.Response:
     config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
     return catalog_response(config.homelab_smoke_signal_targets_path, "Smoke Signal targets")
 
 
@@ -839,10 +772,6 @@ def load_json_file(path: str) -> Any:
 
 
 async def record_workflow_report(request: web.Request) -> web.Response:
-    config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
     try:
         payload = await request.json()
         report = validate_workflow_report_payload(payload)
@@ -865,11 +794,10 @@ async def record_workflow_report(request: web.Request) -> web.Response:
 
 
 async def list_workflow_reports(request: web.Request) -> web.Response:
-    config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
-    limit = parse_limit(request.query.get("limit"))
+    limit = parse_limit(
+        request.query.get("limit"),
+        default=ACCESS_VECTOR.get("list_workflow_reports").parameter("limit").default,
+    )
     reports = request.app[LEDGER_KEY].list_workflow_reports(
         limit=limit,
         workflow=optional_query_string(request.query.get("workflow")),
@@ -878,10 +806,6 @@ async def list_workflow_reports(request: web.Request) -> web.Response:
 
 
 async def get_workflow_report(request: web.Request) -> web.Response:
-    config = request.app[CONFIG_KEY]
-    if not authorized(request, config.homelab_functions_token):
-        return error_response(HTTPStatus.UNAUTHORIZED, "unauthorized", "Invalid or missing bearer token")
-
     try:
         report_id = int(request.match_info["report_id"])
     except ValueError:
@@ -903,9 +827,9 @@ async def get_workflow_report(request: web.Request) -> web.Response:
     return web.json_response({"report": report})
 
 
-def parse_limit(raw_limit: str | None) -> int:
+def parse_limit(raw_limit: str | None, *, default: int) -> int:
     if raw_limit is None or not raw_limit.strip():
-        return 50
+        return default
     try:
         return int(raw_limit)
     except ValueError:
