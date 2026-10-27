@@ -22,6 +22,9 @@
   `HomelabFunctionsClient` method, an MCP tool, a plugin skill entry, and
   behavior-level coverage in `tests/test_access_vector_parity.py`.
 - `/health`, `/docs`, and `/openapi.json` stay public and outside the registry.
+- Callers and their ledger conventions live in `CONSUMERS` in
+ `homelab/consumers.py`. `GET /docs` renders them, and the caller matrix in
+ `docs/architecture.md` must match `consumer_matrix_markdown()` exactly.
 - Do not add generic Home Assistant state, event, or service-call operations
   to the registry. Use `homelab.HomeAssistantWebSocketClient` for that work.
 

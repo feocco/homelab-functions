@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import html
 import json
 import logging
 import os
@@ -15,8 +14,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
-from .access import ACCESS_VECTOR, AccessOperation, AccessParameter
+from .access import (
+    ACCESS_VECTOR,
+    ERROR_RESPONSE_SCHEMA,
+    PUBLIC_ENDPOINTS,
+    AccessOperation,
+    AccessParameter,
+    to_jsonable,
+)
 from .action_recorder import NotificationActionRecorder
+from .docs_page import DOCS_HEADERS, service_docs_html
 from .home_assistant import HomeAssistantConfig
 from .notification_ledger import NotificationLedger
 
@@ -359,23 +366,7 @@ def _openapi_parameter(parameter: AccessParameter) -> dict[str, Any]:
 
 
 def _component_schemas() -> dict[str, Any]:
-    schemas: dict[str, Any] = {
-        "ErrorResponse": {
-            "type": "object",
-            "required": ["error"],
-            "properties": {
-                "error": {
-                    "type": "object",
-                    "required": ["code", "message"],
-                    "properties": {
-                        "code": {"type": "string"},
-                        "message": {"type": "string"},
-                        "detail": {"type": "string"},
-                    },
-                }
-            },
-        }
-    }
+    schemas: dict[str, Any] = {"ErrorResponse": to_jsonable(ERROR_RESPONSE_SCHEMA)}
     schemas.update(ACCESS_VECTOR.component_schemas())
     return schemas
 
@@ -393,6 +384,7 @@ def _openapi_operation(operation: AccessOperation) -> dict[str, Any]:
         "operationId": operation.operation_id,
         "summary": operation.summary,
         "description": operation.description,
+        "tags": [operation.domain],
         "security": [{"bearerAuth": []}],
     }
     if located:
@@ -410,20 +402,6 @@ def _openapi_operation(operation: AccessOperation) -> dict[str, Any]:
     return documented
 
 
-def _protected_doc_rows() -> str:
-    rows: list[str] = []
-    for operation in ACCESS_VECTOR:
-        rows.append(
-            "<tr>"
-            f"<td><code>{html.escape(operation.method)}</code></td>"
-            f"<td><code>{html.escape(operation.path)}</code></td>"
-            f"<td>{html.escape(operation.summary)}</td>"
-            "<td>Bearer token</td>"
-            "</tr>"
-        )
-    return "\n".join(rows)
-
-
 def service_openapi() -> dict[str, Any]:
     document: dict[str, Any] = {
         "openapi": "3.1.0",
@@ -432,6 +410,7 @@ def service_openapi() -> dict[str, Any]:
             "version": "0.1.0",
             "description": "Notification and homelab API service for stable reusable actions.",
         },
+        "tags": [{"name": domain} for domain in ACCESS_VECTOR.domains()],
         "components": {
             "securitySchemes": {
                 "bearerAuth": {
@@ -462,66 +441,6 @@ def service_openapi() -> dict[str, Any]:
     return document
 
 
-def service_docs_html() -> str:
-    document = """<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>homelab-functions API</title>
-    <style>
-      :root {
-        color-scheme: light dark;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #f6f7f9;
-        color: #18202f;
-      }
-      body { margin: 0; }
-      main { max-width: 980px; margin: 0 auto; padding: 48px 20px 64px; }
-      h1 { margin: 0 0 8px; font-size: 2.25rem; letter-spacing: 0; }
-      h2 { margin-top: 32px; font-size: 1.15rem; }
-      p { line-height: 1.55; color: #4b5563; }
-      table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #ffffff; }
-      th, td { padding: 12px; border-bottom: 1px solid #d8dee8; text-align: left; vertical-align: top; }
-      th { color: #1f2937; font-size: 0.85rem; text-transform: uppercase; }
-      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-      a { color: #075985; }
-      .status { display: inline-flex; gap: 8px; align-items: center; font-weight: 600; }
-      .dot { width: 10px; height: 10px; border-radius: 50%; background: #16a34a; }
-      @media (prefers-color-scheme: dark) {
-        :root { background: #101622; color: #f8fafc; }
-        p { color: #cbd5e1; }
-        table { background: #172033; }
-        th, td { border-bottom-color: #334155; }
-        th { color: #e2e8f0; }
-        a { color: #7dd3fc; }
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>homelab-functions</h1>
-      <p>Notification and homelab API service for stable reusable actions.</p>
-      <p class="status"><span class="dot"></span> Healthy when <a href="/health">/health</a> returns <code>status: ok</code>.</p>
-      <h2>Auth</h2>
-      <p>Protected endpoints require <code>Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN</code>. This docs page does not store tokens or run authenticated calls.</p>
-      <h2>API Endpoints</h2>
-      <table>
-        <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Auth</th></tr></thead>
-        <tbody>
-          <tr><td><code>GET</code></td><td><a href="/health"><code>/health</code></a></td><td>Machine-readable health check.</td><td>None</td></tr>
-          <!--protected-routes-->
-        </tbody>
-      </table>
-      <h2>Machine Schema</h2>
-      <p><a href="/openapi.json">OpenAPI JSON</a></p>
-    </main>
-  </body>
-</html>
-"""
-    return document.replace("<!--protected-routes-->", _protected_doc_rows())
-
-
 CONFIG_KEY = web.AppKey("config", Config)
 HA_CLIENT_KEY = web.AppKey("ha_client", HomeAssistantClient)
 LEDGER_KEY = web.AppKey("notification_ledger", NotificationLedger)
@@ -542,6 +461,15 @@ def _bearer_protected(handler):
         return await handler(request)
 
     return protected
+
+
+def _register_public_routes(app: web.Application) -> None:
+    handlers = {"/health": health, "/docs": docs, "/openapi.json": openapi}
+    declared = {endpoint.path for endpoint in PUBLIC_ENDPOINTS}
+    if set(handlers) != declared:
+        raise RuntimeError("Public handlers do not match PUBLIC_ENDPOINTS")
+    for endpoint in PUBLIC_ENDPOINTS:
+        app.router.add_route(endpoint.method, endpoint.path, handlers[endpoint.path])
 
 
 def _register_protected_routes(app: web.Application) -> None:
@@ -594,9 +522,7 @@ def create_app(
         )
         app.on_startup.append(start_action_recorder)
         app.on_cleanup.append(stop_action_recorder)
-    app.router.add_get("/docs", docs)
-    app.router.add_get("/openapi.json", openapi)
-    app.router.add_get("/health", health)
+    _register_public_routes(app)
     _register_protected_routes(app)
     return app
 
@@ -621,7 +547,11 @@ async def stop_action_recorder(app: web.Application) -> None:
 
 
 async def docs(_request: web.Request) -> web.Response:
-    return web.Response(text=service_docs_html(), content_type="text/html")
+    return web.Response(
+        text=service_docs_html(),
+        content_type="text/html",
+        headers=DOCS_HEADERS,
+    )
 
 
 async def openapi(_request: web.Request) -> web.Response:
