@@ -1,28 +1,51 @@
 # homelab-functions
 
-`homelab-functions` is a small local broker and helper package for common
-homelab actions.
+`homelab-functions` is a small broker for shared homelab actions, such as
+notifying Joe or Jess, plus a Python helper package for talking to it and to
+Home Assistant.
 
-Use the deployed HTTP service for common stable functions, especially notifying
-Joe or Jess. Use the client-side Home Assistant helper for service-specific
-discovery, state reads, event listeners, and direct service calls.
+- **Reference:** `GET /docs` on a running server lists every action with its
+  parameters, status codes, and copyable HTTP, Python, and MCP examples.
+  `GET /openapi.json` is the same contract for machines.
+- **Explanation:** [docs/architecture.md](docs/architecture.md) covers the
+  access registry, the [caller matrix](docs/architecture.md#callers), the
+  notification and report flows, and the security model.
+- **How-to:** the sections below.
 
-## Notify Joe
+## Quickstart
 
-```python
-import homelab
+Run the server locally, open the reference, and send one notification.
 
-homelab.notify_joe(
-    "Test notification",
-    "homelab-functions is working",
-    tag="homelab-functions-test",
-)
+Put the server variables from [Configuration](#configuration) in `.env`, then:
+
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -e '.[test]'
+./.venv/bin/python -m homelab.server
 ```
 
-The helper calls the local `homelab-functions` HTTP service. Callers do not need
-Home Assistant credentials or WebSocket code.
+Open <http://127.0.0.1:8091/docs>. In another shell:
 
-## Notify Jess
+```bash
+export HOMELAB_FUNCTIONS_URL=http://127.0.0.1:8091
+export HOMELAB_FUNCTIONS_TOKEN=replace_me
+./.venv/bin/python -c 'import homelab; print(homelab.notify_joe("Hello", "homelab-functions is working"))'
+```
+
+The response includes `"status": "sent"` and a `notification_id`.
+
+## How-to guides
+
+Every protected action can be called three ways. Python helpers and the MCP
+server read `HOMELAB_FUNCTIONS_URL` and `HOMELAB_FUNCTIONS_TOKEN`.
+
+| Call shape | Entry point |
+| --- | --- |
+| HTTP | `$HOMELAB_FUNCTIONS_URL/v1/...` with `Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN` |
+| Python | `homelab.HomelabFunctionsClient` or module helpers such as `homelab.notify_joe` |
+| MCP | `python3 -m homelab.mcp_server`. Tool names match operation ids. |
+
+### Notify Joe or Jess
 
 ```python
 import homelab
@@ -30,59 +53,107 @@ import homelab
 homelab.notify_jess(
     "Dinner plan",
     "Please review and accept the weekly plan.",
-    tag="mealie-planner-plan-id",
+    tag="mealie-planner-2026-w44",
     group="mealie-planner",
+    buttons=[{"title": "Open plan", "uri": "/lovelace/meals"}],
 )
 ```
 
-Jess notifications use the same broker and payload shape as Joe notifications,
-but route to the configured `HA_NOTIFY_JESS_SERVICE`.
+`notify_joe` takes the same arguments. Use a tag that is unique per
+conversation, and the group your caller owns in the
+[caller matrix](docs/architecture.md#callers).
 
-## Python client
+### Check for a reply
 
-`HomelabFunctionsClient` calls every protected action. The constructor takes
-the service URL, bearer token, and timeout. The action list is
-`homelab.access.ACCESS_VECTOR`.
+The server records every notification button press in the shared ledger.
+Poll by tag:
 
 ```python
-from homelab import HomelabFunctionsClient
-
-client = HomelabFunctionsClient(
-    "http://127.0.0.1:8091",
-    token="replace_me",
-    timeout=10,
-)
-client.notify_joe("Plant status", "Ficus needs water.")
-catalog = client.get_service_catalog()
-targets = client.get_smoke_signal_targets()
+latest = homelab.list_notifications(tag="mealie-planner-2026-w44", limit=1)
+record = latest["notifications"][0]
+if record["status"] == "responded":
+    print(record["actions"][0]["action"], record["actions"][0].get("reply_text"))
 ```
 
-The module-level helpers, including `notify_joe`, `get_service_catalog`,
-`get_smoke_signal_targets`, `list_workflow_reports`, and `get_workflow_report`,
-use the same client. When you omit the URL or token, they read
-`HOMELAB_FUNCTIONS_URL` and `HOMELAB_FUNCTIONS_TOKEN`.
+### Handle a button press in your own service
 
-## MCP and the Cursor plugin
+Long-running services that need to act on a button immediately listen for
+`mobile_app_notification_action` themselves and route by prefix:
 
-This repo includes a Cursor plugin. `.cursor-plugin/plugin.json` points at
-`mcp.json` and `skills/`. The plugin starts a stdio MCP server with
-`python3 -m homelab.mcp_server`. The `homelab-functions-mcp` command starts
-that same server.
+```python
+import homelab
 
-`.cursor-plugin/plugin.json` declares `HOMELAB_FUNCTIONS_URL` with default
-`http://127.0.0.1:8091` and requires `HOMELAB_FUNCTIONS_TOKEN`. `mcp.json`
-passes those values as `${HOMELAB_FUNCTIONS_URL}` and
-`${HOMELAB_FUNCTIONS_TOKEN}`, and sets the server working directory to
-`${CURSOR_PLUGIN_ROOT}`. The server does not embed a token. Its tools are
-the protected actions in `homelab.access.ACCESS_VECTOR`.
+router = homelab.NotificationActionRouter()
+router.register("SRE_APPROVE", handle_approval)
 
-Use `homelab.HomeAssistantWebSocketClient` for Home Assistant state, events,
-and service calls. Do not add those operations to the broker.
+button = {
+    "title": "Approve",
+    "action": homelab.NotificationActionRouter.make_action("SRE_APPROVE", "417"),
+}
 
-## Home Assistant Client Helper
+async def on_event(event: dict) -> None:
+    router.handle_event(event)
 
-For services that need Home Assistant state or events, connect directly to Home
-Assistant with the shared helper instead of copying WebSocket boilerplate.
+async with homelab.HomeAssistantWebSocketClient.from_env() as ha:
+    ha.add_event_handler(on_event)
+    await ha.subscribe_events("mobile_app_notification_action")
+    await ha.wait_closed()
+```
+
+Store the decision in the shared ledger with
+`homelab.record_notification_action("SRE_APPROVE::417", tag="sre-incident-417", group="homelab-sre")`.
+For a typed reply, add `"behavior": "textInput"`, `"textInputButtonTitle"`, and
+`"textInputPlaceholder"` to the button and read `reply_text` from the event.
+
+### Add a Report button to a workflow
+
+```python
+homelab.notify_joe(
+    "Cat food monitor",
+    "Morning food check failed.",
+    tag="cat-food-monitor-morning",
+    group="cat-food-monitor",
+    buttons=[homelab.workflow_report_button("cat-food-monitor")],
+)
+```
+
+When the workflow's listener receives `WORKFLOW_REPORT::cat-food-monitor`,
+record what Joe typed:
+
+```python
+data = event["data"]
+homelab.record_workflow_report("cat-food-monitor", data["reply_text"], source="mobile-action", event=data)
+```
+
+Read reports back with `homelab.list_workflow_reports(workflow="cat-food-monitor")`
+or `homelab.get_workflow_report(report_id)`.
+
+### Read the service catalog
+
+```python
+services = homelab.get_service_catalog()["services"]
+targets = homelab.get_smoke_signal_targets()["targets"]
+```
+
+`homelab-config` generates both files. The server only authenticates and
+returns them.
+
+### Use the MCP server or Cursor plugin
+
+`.cursor-plugin/plugin.json` points at `mcp.json` and `skills/`. The plugin
+requires `HOMELAB_FUNCTIONS_TOKEN` and defaults `HOMELAB_FUNCTIONS_URL` to
+`http://127.0.0.1:8091`. To run the server by hand:
+
+```bash
+HOMELAB_FUNCTIONS_TOKEN=replace_me python3 -m homelab.mcp_server
+```
+
+The server uses only the standard library. `homelab-functions-mcp` is the
+installed command for the same server.
+
+### Read Home Assistant state, events, or call a service
+
+Connect to Home Assistant directly. Do not add these operations to the broker.
 
 ```python
 import homelab
@@ -93,205 +164,23 @@ async with homelab.HomeAssistantWebSocketClient.from_env() as ha:
     await ha.call_service("switch", "turn_on", {"entity_id": "switch.example"})
 ```
 
-Subscribed event handlers run outside the WebSocket reader task, so a handler can
-call `get_states()` or `call_service()` on the same client without blocking the
-response reader.
+Event handlers run outside the WebSocket reader task, so a handler can call
+`get_states()` or `call_service()` on the same client. `help(homelab.HomeAssistantWebSocketClient)`
+shows the full API.
 
-The helper reads:
+## Reference
 
-```text
-HA_URL=https://example.ui.nabu.casa
-HA_LONG_LIVED_TOKEN=replace_me
-HA_REQUEST_TIMEOUT_SECONDS=30
-```
-
-The public helper methods have docstrings. From an interactive Python shell:
-
-```python
-import homelab
-
-help(homelab.HomeAssistantWebSocketClient)
-```
-
-## Actionable Notification Callbacks
-
-For services that send Home Assistant mobile notification buttons and need to
-handle the button press, use `NotificationActionRouter` with a direct
-`HomeAssistantWebSocketClient` subscription.
-
-```python
-import homelab
-
-router = homelab.NotificationActionRouter()
-router.register("MY_SERVICE_APPROVE", handle_approval)
-
-button = {
-    "title": "Approve",
-    "action": homelab.NotificationActionRouter.make_action("MY_SERVICE_APPROVE", token),
-}
-
-async def handle_ha_event(event: dict) -> None:
-    router.handle_event(event)
-```
-
-The deployed `homelab-functions` server records
-`mobile_app_notification_action` events in the shared notification ledger, but
-it does not route or execute those actions. Each long-running service still owns
-its own Home Assistant listener and business logic.
-
-Buttons that request a typed response can include Home Assistant text-input
-fields. The service that listens for the action reads `reply_text` from the
-`mobile_app_notification_action` event.
-
-```python
-button = {
-    "title": "Reply",
-    "action": homelab.NotificationActionRouter.make_action("MY_SERVICE_REPLY", token),
-    "behavior": "textInput",
-    "textInputButtonTitle": "Send",
-    "textInputPlaceholder": "Add a note",
-}
-```
-
-Do not use the deployed `homelab-functions` server as a generic Home Assistant
-proxy. Add named server endpoints only for stable reusable actions.
-
-## Service API
-
-`homelab.access.ACCESS_VECTOR` is the registry of protected `/v1` actions.
-HTTP routes, OpenAPI operation ids, `HomelabFunctionsClient`, and the MCP
-tools all come from that registry.
-
-These routes stay public and are not in the registry.
+Protected actions are declared in `homelab.access.ACCESS_VECTOR`. The routes,
+OpenAPI document, client methods, MCP tools, and `/docs` page all come from it.
+These routes are public:
 
 - `GET /health`
 - `GET /docs`
 - `GET /openapi.json`
 
-Protected endpoints require:
+### Configuration
 
-```text
-Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN
-```
-
-The browser docs page documents protected endpoints but does not store tokens
-or execute authenticated calls.
-
-The catalog endpoints serve generated JSON files mounted into the container.
-`homelab-config` owns the catalog generation; this service only authenticates
-and returns the files:
-
-```text
-HOMELAB_CATALOG_PATH=/app/config/service-catalog.json
-HOMELAB_SMOKE_SIGNAL_TARGETS_PATH=/app/config/smoke-signal-targets.json
-```
-
-Example request:
-
-```json
-{
-  "title": "Plant status",
-  "message": "Ficus needs water.",
-  "tag": "plant-monitor-ficus",
-  "group": "plant-monitor",
-  "url": "/lovelace/plants",
-  "buttons": [
-    {"title": "Open plants", "uri": "/lovelace/plants"},
-    {
-      "title": "Reply",
-      "action": "PLANT_REPLY::token",
-      "behavior": "textInput",
-      "textInputButtonTitle": "Send",
-      "textInputPlaceholder": "Add a note"
-    }
-  ]
-}
-```
-
-Successful notification sends are written to the shared notification ledger.
-Services that listen for their own `mobile_app_notification_action` events can
-record the response without turning `homelab-functions` into a generic action
-router:
-
-```python
-homelab.record_notification_action(
-    "PLANT_REPLY::token",
-    tag="plant-monitor-ficus",
-    group="plant-monitor",
-    reply_text="Watered today",
-    event=home_assistant_event_data,
-)
-```
-
-The recent ledger can be inspected with:
-
-```python
-homelab.list_notifications(group="plant-monitor", limit=20)
-```
-
-## Workflow Reports
-
-Workflow reports are a standard way to turn a phone notification into a durable
-"please investigate this workflow" record. A workflow can add the shared Report
-button to any notification:
-
-```python
-import homelab
-
-homelab.notify_joe(
-    "Cat food monitor",
-    "Morning food check failed.",
-    tag="cat-food-monitor-morning",
-    group="cat-food-monitor",
-    buttons=[homelab.workflow_report_button("cat-food-monitor")],
-)
-```
-
-The Report button uses Home Assistant's mobile text-input action. The workflow
-that listens for `mobile_app_notification_action` events records Joe's submitted
-text:
-
-```python
-import homelab
-
-router = homelab.NotificationActionRouter()
-
-
-def handle_report(workflow_slug: str, event: dict) -> None:
-    data = event.get("data", {})
-    homelab.record_workflow_report(
-        workflow_slug,
-        data["reply_text"],
-        source="mobile-action",
-        event=data,
-    )
-
-
-router.register("WORKFLOW_REPORT", handle_report)
-```
-
-Workflow slugs are caller-owned strings. Prefer stable kebab-case names such as
-`cat-food-monitor`, but `homelab-functions` does not keep a workflow registry.
-
-Recent reports can be inspected with the client or the service API:
-
-```python
-reports = homelab.list_workflow_reports(workflow="cat-food-monitor", limit=20)
-report = homelab.get_workflow_report(reports["reports"][0]["id"])
-```
-
-```bash
-curl -H "Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN" \
-  "$HOMELAB_FUNCTIONS_URL/v1/workflow-reports?workflow=cat-food-monitor&limit=20"
-```
-
-V1 only records reports. It does not launch Codex, Cursor, GitHub issues, or a
-webhook. Future investigator services should consume these report records by id
-or through a dedicated relay.
-
-## Configuration
-
-Server runtime environment:
+Server:
 
 ```text
 HA_URL=https://example.ui.nabu.casa
@@ -306,21 +195,32 @@ LOG_LEVEL=INFO
 REQUEST_TIMEOUT_SECONDS=10
 NOTIFICATION_LEDGER_PATH=/app/data/notifications.sqlite3
 NOTIFICATION_ACTION_RECORDER_ENABLED=true
+HOMELAB_CATALOG_PATH=/app/config/service-catalog.json
+HOMELAB_SMOKE_SIGNAL_TARGETS_PATH=/app/config/smoke-signal-targets.json
 ```
 
-Client helper environment:
+Python client and MCP server:
 
 ```text
 HOMELAB_FUNCTIONS_URL=http://homelab-functions:8091
 HOMELAB_FUNCTIONS_TOKEN=replace_me
 ```
 
-## Local
+`HomeAssistantWebSocketClient.from_env()`:
+
+```text
+HA_URL=https://example.ui.nabu.casa
+HA_LONG_LIVED_TOKEN=replace_me
+HA_REQUEST_TIMEOUT_SECONDS=30
+```
+
+## Development
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e '.[test]'
-pytest
-SERVICE_PORT=8091 python -m homelab.server
+./.venv/bin/pytest -q
 ```
+
+`tests/test_access_vector_parity.py` fails when the registry, routes, client,
+MCP tools, `/docs` page, caller matrix, or skill drift apart. See
+[What changes together](docs/architecture.md#what-changes-together) before
+adding an action.
