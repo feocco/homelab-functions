@@ -122,6 +122,50 @@ cloning `homelab-config`.
 - The broker has no generic state, event, or service-call route. Adding one
   would turn the token into Home Assistant admin access.
 
+## Pebble ring relay
+
+`POST /v1/pebble` accepts the Pebble Index webhook and forwards JSON to the
+configured Grok webhook. The ring posts `multipart/form-data` in every Hold
+and Talk mode. When a recording has no transcription, the server transcribes
+it with xAI and still forwards only JSON. The audio file stays on disk until
+`PEBBLE_AUDIO_TTL_SECONDS` (default 24 hours). The event id is stored in
+SQLite and still dedupes after the audio file is gone, including across a
+restart.
+
+The route is declared in `HTTP_ONLY_OPERATIONS` in `homelab/access.py`, not in
+`ACCESS_VECTOR`. The ring token is `PEBBLE_RING_TOKEN`. Putting this route in
+the shared registry would authorize it with `HOMELAB_FUNCTIONS_TOKEN` and
+would publish a JSON client method and an MCP tool. The client and MCP speak
+JSON with that shared token, and a tool that accepted the recording would put
+raw audio on the agent path. OpenAPI and `GET /docs` still document the
+route. `tests/test_access_vector_parity.py` asserts it is absent from the
+client and from `tools/list`.
+
+Joe sets this URL in the Pebble app:
+
+`https://homelab-functions.home.feocco.com/v1/pebble`
+
+That hostname is the existing private route in homelab-config
+(`services/homelab-functions/ops.yaml`). Caddy reverse-proxies it to port
+8091 with no Authentik gate. On the LAN, UniFi DNS resolves the name to the
+Mac mini. Off the LAN, the existing DNS-only record points at the Mac mini
+tailnet address `100.81.237.11`. No DNS, Cloudflare, or Tailscale change is
+required. The phone sends `Authorization: Bearer $PEBBLE_RING_TOKEN`.
+
+The same host already serves the app over Tailscale HTTP on port 8091
+(`hosts/macmini/tailscale-serve.yaml`). If the ring app cannot use the HTTPS
+name, the phone can use `http://100.81.237.11:8091/v1/pebble` or
+`http://maclabs-mac-mini.taildf3445.ts.net:8091/v1/pebble` while it is on the
+tailnet.
+
+homelab-config follow-up, not part of deploying this image: add
+`PEBBLE_RING_TOKEN` and `GROK_PEBBLE_WEBHOOK_KEY` to the service secret list,
+and set `XAI_API_KEY` when the ring will send audio without a transcription.
+Leave the route, DNS, and Tailscale Serve config as they are. The container
+already mounts `./data` on `/app/data`, which holds the dedupe ledger and the
+short-lived audio files. `GET /docs` on the existing service is the catalog
+`docs_url` for this API, so the catalog generator does not need a new path.
+
 ## What changes together
 
 Adding or changing a protected action touches all of these in one change:
@@ -138,3 +182,7 @@ Adding or changing a protected action touches all of these in one change:
 
 The MCP tool, OpenAPI operation, and `/docs` card follow from the registry
 with no extra code.
+
+`POST /v1/pebble` does not follow that list. A change to it updates
+`HTTP_ONLY_OPERATIONS`, the handler, OpenAPI, `GET /docs`, and the parity
+test that proves the client and MCP still omit it.

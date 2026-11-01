@@ -22,6 +22,11 @@
   `HomelabFunctionsClient` method, an MCP tool, a plugin skill entry, and
   behavior-level coverage in `tests/test_access_vector_parity.py`.
 - `/health`, `/docs`, and `/openapi.json` stay public and outside the registry.
+- `POST /v1/pebble` is the one HTTP-only exception. It lives in
+  `HTTP_ONLY_OPERATIONS`, not `ACCESS_VECTOR`, because the ring posts
+  multipart audio and authenticates with `PEBBLE_RING_TOKEN`. Do not give it
+  a `HomelabFunctionsClient` method or an MCP tool. OpenAPI, `GET /docs`, and
+  `tests/test_access_vector_parity.py` still have to name it.
 - Callers and their ledger conventions live in `CONSUMERS` in
  `homelab/consumers.py`. `GET /docs` renders them, and the caller matrix in
  `docs/architecture.md` must match `consumer_matrix_markdown()` exactly.
