@@ -130,7 +130,10 @@ and Talk mode. When a recording has no transcription, the server transcribes
 it with xAI and still forwards only JSON. The audio file stays on disk until
 `PEBBLE_AUDIO_TTL_SECONDS` (default 24 hours). The event id is stored in
 SQLite and still dedupes after the audio file is gone, including across a
-restart.
+restart. Only allowlisted Pebble fields leave the host, timestamps must be
+within five minutes of the server clock, and duplicate detection happens
+before an attached audio file is persisted. The 9 MiB request-body limit is
+scoped to this route; other routes keep aiohttp's default 1 MiB limit.
 
 The route is declared in `HTTP_ONLY_OPERATIONS` in `homelab/access.py`, not in
 `ACCESS_VECTOR`. The ring token is `PEBBLE_RING_TOKEN`. Putting this route in

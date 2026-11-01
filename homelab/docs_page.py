@@ -574,15 +574,16 @@ _UNAUTHORIZED_EXAMPLE = json.dumps(
 
 def _pebble_section() -> str:
     operation = HTTP_ONLY_OPERATIONS[0]
-    example = """curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \\
+    example = """timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \\
   -H "Authorization: Bearer $PEBBLE_RING_TOKEN" \\
   -H "Content-Type: application/json" \\
-  -d '{"event_id":"ring-event-1","event_type":"single-click-hold","recordedAt":"1790037251116","transcription":"Turn the lights off","client":"ring"}'"""
+  -d "{\\"event_id\\":\\"ring-event-1\\",\\"event_type\\":\\"single-click-hold\\",\\"timestamp\\":\\"$timestamp\\",\\"transcription\\":\\"Turn the lights off\\",\\"client\\":\\"ring\\"}" """
     multipart = """curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \\
   -H "Authorization: Bearer $PEBBLE_RING_TOKEN" \\
   -H "X-Index-Trigger: single-click-hold" \\
   -H "X-Index-Delivery: ring-event-1" \\
-  -F "recordedAt=1790037251116" \\
+  -F "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
   -F "client=ring" \\
   -F "audio=@clip.m4a;type=audio/mp4" """
     rows = "".join(
@@ -596,8 +597,8 @@ def _pebble_section() -> str:
         for name, where, kind, note in (
             ("audio", "multipart file", "binary", "Stored locally until the TTL. Never forwarded."),
             ("transcription", "text or JSON", "string", "When missing and audio is present, xAI transcribes it."),
-            ("recordedAt", "text or JSON", "string", "Unix milliseconds. One of recordedAt or timestamp is required."),
-            ("timestamp", "text or JSON", "string", "ISO-8601 alternative to recordedAt."),
+            ("recordedAt", "text or JSON", "string", "Unix milliseconds within five minutes of the server clock. One of recordedAt or timestamp is required."),
+            ("timestamp", "text or JSON", "string", "ISO-8601 time within five minutes of the server clock. One of recordedAt or timestamp is required."),
             ("event_type", "text, JSON, or X-Index-Trigger", "string", "Gesture, such as single-click-hold."),
             ("event_id", "text, JSON, or X-Index-Delivery", "string", "Dedupe key. Derived when the phone omits it."),
             ("client", "text or JSON", "string", "Pebble sends ring."),
