@@ -153,12 +153,13 @@ Send `Authorization: Bearer $PEBBLE_RING_TOKEN`. That token is not
 curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \
   -H "Authorization: Bearer $PEBBLE_RING_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"event_id":"ring-event-1","event_type":"single-click-hold","recordedAt":"1790037251116","transcription":"Turn the lights off","client":"ring"}'
+  -d "{\"event_id\":\"ring-event-1\",\"event_type\":\"single-click-hold\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"transcription\":\"Turn the lights off\",\"client\":\"ring\"}"
 ```
 
 The server forwards JSON, including `event_id`, `event_type`, `timestamp`,
-`transcript`, `audio_duration_seconds`, and the original text fields. It does
-not forward the audio file. See
+`transcript`, `audio_duration_seconds`, and allowlisted Pebble source fields.
+Events more than five minutes from the server clock are rejected. The server
+does not forward the audio file, and the route rejects bodies over 9 MiB. See
 [Pebble ring relay](docs/architecture.md#pebble-ring-relay) for the tailnet
 fallback and the homelab-config secret follow-up.
 

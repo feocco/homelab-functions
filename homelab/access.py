@@ -484,13 +484,25 @@ class HttpOnlyOperation:
 
 _PEBBLE_TEXT_PROPERTIES: dict[str, Any] = {
     "transcription": {"type": "string"},
-    "recordedAt": {"type": "string"},
+    "recordedAt": {
+        "type": "string",
+        "description": (
+            "Unix milliseconds within five minutes of the server clock. "
+            "One of recordedAt or timestamp is required."
+        ),
+    },
     "client": {"type": "string"},
     "test": {"type": "string"},
     "event_id": {"type": "string"},
     "event_type": {"type": "string"},
     "trigger": {"type": "string"},
-    "timestamp": {"type": "string"},
+    "timestamp": {
+        "type": "string",
+        "description": (
+            "ISO-8601 time within five minutes of the server clock. "
+            "One of recordedAt or timestamp is required."
+        ),
+    },
     "transcript": {"type": "string"},
     "audio_duration_seconds": {"type": "number"},
 }
@@ -526,7 +538,9 @@ HTTP_ONLY_OPERATIONS: tuple[HttpOnlyOperation, ...] = (
         summary="Relay a Pebble Index ring recording",
         description=(
             "Accept a Pebble Index webhook (multipart audio or JSON text) and forward JSON "
-            "to the configured Grok webhook. Raw audio stays on this host until its TTL. "
+            "to the configured Grok webhook. Only allowlisted fields are forwarded. Raw audio "
+            "stays on this host until its TTL. Event timestamps must be within five minutes "
+            "of the server clock, and the request body is limited to 9 MiB. "
             f"The phone posts to {PEBBLE_PHONE_URL} with Authorization: Bearer $PEBBLE_RING_TOKEN. "
             "This route is HTTP-only. It is not a HomelabFunctionsClient method or an MCP tool."
         ),
@@ -537,7 +551,8 @@ HTTP_ONLY_OPERATIONS: tuple[HttpOnlyOperation, ...] = (
         errors=(
             AccessError("400", "Invalid request"),
             AccessError("401", "Missing or invalid pebble token"),
-            AccessError("413", "Audio payload is too large"),
+            AccessError("409", "Another request is processing this event id"),
+            AccessError("413", "Pebble request or audio payload is too large"),
             AccessError("415", "Unsupported media type"),
             AccessError("502", "Transcription or webhook forwarding failed"),
             AccessError("503", "Pebble relay is not configured"),

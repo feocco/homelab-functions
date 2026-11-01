@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import logging
@@ -14,7 +15,9 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from homelab.pebble import (
     DEFAULT_GROK_PEBBLE_WEBHOOK_URL,
+    EVENT_FRESHNESS_WINDOW,
     MAX_AUDIO_BYTES,
+    MAX_PEBBLE_BODY_BYTES,
     PebbleLedger,
     PebbleRequestError,
     XaiSpeechTranscriber,
@@ -28,8 +31,15 @@ RING = "pebble-ring-token-do-not-log"
 WEBHOOK_KEY = "grok-pebble-webhook-key-do-not-log"
 XAI_KEY = "xai-test-key-do-not-log"
 BROKER = "broker-token-do-not-share"
-RECORDED_AT = "1790037251116"
 AUDIO = b"AUDIO-SENTINEL-9f3c-not-audio"
+
+
+def recorded_at(*, offset: timedelta = timedelta()) -> str:
+    moment = datetime.now(timezone.utc) + offset
+    return str(int(moment.timestamp() * 1000))
+
+
+RECORDED_AT = recorded_at()
 
 
 class FakeForwarder:
@@ -45,6 +55,18 @@ class FakeForwarder:
                 "webhook_failed",
                 "Grok webhook rejected the pebble event",
             )
+
+
+class BlockingForwarder(FakeForwarder):
+    def __init__(self):
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def post_json(self, url, key, payload):
+        self.calls.append({"url": url, "key": key, "payload": payload})
+        self.started.set()
+        await self.release.wait()
 
 
 class FakeTranscriber:
@@ -170,9 +192,9 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notify.status, 401)
         self.assertEqual(self.forwarder.calls, [])
 
-    async def test_json_forwards_normalized_and_original_fields(self):
+    async def test_json_forwards_only_allowlisted_fields(self):
         response = await self.post_json(
-            self.json_body(note="kitchen", audio_duration_seconds=2.25)
+            self.json_body(note="must-not-leave-host", audio_duration_seconds=2.25)
         )
         self.assertEqual(response.status, 200)
         body = await response.json()
@@ -188,9 +210,24 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["transcription"], "Hello from json")
         self.assertEqual(payload["recordedAt"], RECORDED_AT)
         self.assertEqual(payload["client"], "ring")
-        self.assertEqual(payload["note"], "kitchen")
-        self.assertEqual(payload["original"]["note"], "kitchen")
+        self.assertNotIn("note", payload)
+        self.assertNotIn("note", payload["original"])
+        self.assertEqual(
+            set(payload),
+            {
+                "audio_duration_seconds",
+                "client",
+                "event_id",
+                "event_type",
+                "original",
+                "recordedAt",
+                "timestamp",
+                "transcript",
+                "transcription",
+            },
+        )
         self.assertNotIn("audio", payload)
+        self.assertNotIn("must-not-leave-host", json.dumps(payload))
         self.assertNotIn(AUDIO.decode(), json.dumps(payload))
         self.assertEqual(self.transcriber.calls, [])
 
@@ -254,6 +291,80 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.forwarder.calls), 1)
         self.assertEqual(self.transcriber.calls, [])
 
+    async def test_duplicate_audio_does_not_overwrite_the_stored_recording(self):
+        headers = {
+            "X-Index-Trigger": "single-click-hold",
+            "X-Index-Delivery": "dedupe-before-audio",
+        }
+        first = await self.post_multipart(
+            transcription="keep the first recording",
+            recordedAt=RECORDED_AT,
+            audio=AUDIO,
+            headers=headers,
+        )
+        stored = list((self.root / "audio").glob("*.m4a"))
+        self.assertEqual(first.status, 200)
+        self.assertEqual(len(stored), 1)
+
+        replacement = b"REPLACEMENT-AUDIO-MUST-NOT-BE-PERSISTED"
+        duplicate = await self.post_multipart(
+            transcription="keep the first recording",
+            recordedAt=RECORDED_AT,
+            audio=replacement,
+            headers=headers,
+        )
+        self.assertEqual(duplicate.status, 200)
+        self.assertTrue((await duplicate.json())["duplicate"])
+        self.assertEqual(stored[0].read_bytes(), AUDIO)
+        current = list((self.root / "audio").glob("*.m4a"))
+        self.assertEqual(current, stored)
+        self.assertNotIn(replacement, [path.read_bytes() for path in current])
+
+    async def test_concurrent_duplicate_does_not_forward_or_persist_twice(self):
+        await self.client.close()
+        blocking = BlockingForwarder()
+        self.client = TestClient(TestServer(app_for(self.root, blocking, self.transcriber)))
+        await self.client.start_server()
+        headers = {
+            "X-Index-Trigger": "single-click-hold",
+            "X-Index-Delivery": "concurrent-dedupe",
+        }
+        first_task = asyncio.create_task(
+            self.post_multipart(
+                transcription="first",
+                recordedAt=RECORDED_AT,
+                audio=AUDIO,
+                headers=headers,
+            )
+        )
+        await blocking.started.wait()
+        try:
+            duplicate = await self.post_multipart(
+                transcription="second",
+                recordedAt=RECORDED_AT,
+                audio=b"SECOND-AUDIO-MUST-NOT-BE-PERSISTED",
+                headers=headers,
+            )
+        finally:
+            blocking.release.set()
+        first = await first_task
+
+        self.assertEqual(first.status, 200)
+        self.assertEqual(duplicate.status, 409)
+        self.assertEqual((await duplicate.json())["error"]["code"], "event_in_progress")
+        completed_duplicate = await self.post_multipart(
+            transcription="third",
+            recordedAt=RECORDED_AT,
+            audio=b"THIRD-AUDIO-MUST-NOT-BE-PERSISTED",
+            headers=headers,
+        )
+        self.assertEqual(completed_duplicate.status, 200)
+        self.assertTrue((await completed_duplicate.json())["duplicate"])
+        self.assertEqual(len(blocking.calls), 1)
+        stored = list((self.root / "audio").glob("*.m4a"))
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].read_bytes(), AUDIO)
+
     async def test_same_multipart_without_a_delivery_id_dedupes(self):
         fields = dict(transcription="same words", recordedAt=RECORDED_AT, client="ring")
         headers = {"X-Index-Trigger": "single-click-hold"}
@@ -311,6 +422,19 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         create_app(make_config(self.root))
         self.assertFalse(path.exists())
 
+    async def test_startup_releases_an_interrupted_pending_claim(self):
+        await self.client.close()
+        ledger = PebbleLedger(str(self.root / "pebble.sqlite3"), str(self.root / "audio"))
+        self.assertEqual(ledger.claim("interrupted-event"), "new")
+        self.client = TestClient(
+            TestServer(app_for(self.root, self.forwarder, self.transcriber))
+        )
+        await self.client.start_server()
+
+        response = await self.post_json(self.json_body(event_id="interrupted-event"))
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["status"], "forwarded")
+
     async def test_webhook_failure_can_be_retried(self):
         await self.client.close()
         flaky = FakeForwarder(fail_times=1)
@@ -322,6 +446,37 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         retried = await self.post_json(self.json_body())
         self.assertEqual((await retried.json())["status"], "forwarded")
         self.assertEqual(len(flaky.calls), 2)
+
+    async def test_rejects_timestamps_outside_the_freshness_window(self):
+        self.assertEqual(EVENT_FRESHNESS_WINDOW, timedelta(minutes=5))
+        outside = timedelta(minutes=6)
+        stale = await self.post_multipart(
+            transcription="stale event",
+            recordedAt=recorded_at(offset=-outside),
+            audio=AUDIO,
+            headers={
+                "X-Index-Trigger": "single-click-hold",
+                "X-Index-Delivery": "stale-event",
+            },
+        )
+        self.assertEqual(stale.status, 400)
+        stale_error = (await stale.json())["error"]
+        self.assertEqual(stale_error["detail"], "recordedAt")
+        self.assertIn("freshness window", stale_error["message"])
+
+        future = datetime.now(timezone.utc) + outside
+        future_response = await self.post_json(
+            {
+                "event_id": "future-event",
+                "event_type": "single-click-hold",
+                "timestamp": future.isoformat(),
+                "transcription": "future event",
+            }
+        )
+        self.assertEqual(future_response.status, 400)
+        self.assertEqual((await future_response.json())["error"]["detail"], "timestamp")
+        self.assertEqual(self.forwarder.calls, [])
+        self.assertEqual(list((self.root / "audio").glob("*.m4a")), [])
 
     async def test_transcription_failure_does_not_stick_as_a_duplicate(self):
         self.transcriber.fail = True
@@ -358,6 +513,15 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await missing_text.json())["error"]["detail"], "transcription")
         missing_time = await self.post_json({"event_type": "single-click-hold", "transcription": "hi"})
         self.assertEqual(missing_time.status, 400)
+        overflowing_time = await self.post_json(
+            {
+                "event_type": "single-click-hold",
+                "recordedAt": "9" * 100,
+                "transcription": "hi",
+            }
+        )
+        self.assertEqual(overflowing_time.status, 400)
+        self.assertEqual((await overflowing_time.json())["error"]["detail"], "recordedAt")
         huge = await self.post_multipart(
             recordedAt=RECORDED_AT,
             audio=b"y" * (MAX_AUDIO_BYTES + 1),
@@ -365,6 +529,70 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(huge.status, 413)
         self.assertEqual((await huge.json())["error"]["code"], "audio_too_large")
+        self.assertEqual(self.forwarder.calls, [])
+
+    async def test_nine_mib_body_cap_is_scoped_to_the_pebble_route(self):
+        over_default = self.json_body(padding="x" * (1024 * 1024))
+        accepted = await self.post_json(over_default)
+        self.assertEqual(accepted.status, 200)
+        self.assertNotIn("padding", self.forwarder.calls[0]["payload"])
+
+        ordinary_route = await self.client.post(
+            "/v1/notify/joe",
+            data=b"x" * (1024 * 1024 + 1),
+            headers={
+                "Authorization": f"Bearer {BROKER}",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(ordinary_route.status, 413)
+
+        oversized = await self.client.post(
+            "/v1/pebble",
+            data=b"x" * (MAX_PEBBLE_BODY_BYTES + 1),
+            headers={
+                "Authorization": f"Bearer {RING}",
+                "Content-Type": "application/json",
+            },
+        )
+        self.assertEqual(oversized.status, 413)
+        self.assertEqual((await oversized.json())["error"]["code"], "request_too_large")
+        self.assertEqual(len(self.forwarder.calls), 1)
+
+    async def test_chunked_multipart_body_cannot_bypass_the_nine_mib_cap(self):
+        boundary = "pebble-body-limit"
+        first = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="audio"; filename="first.m4a"\r\n'
+            "Content-Type: audio/mp4\r\n\r\n"
+        ).encode()
+        second = (
+            f"\r\n--{boundary}\r\n"
+            'Content-Disposition: form-data; name="audio"; filename="second.m4a"\r\n'
+            "Content-Type: audio/mp4\r\n\r\n"
+        ).encode()
+        body = (
+            first
+            + b"a" * MAX_AUDIO_BYTES
+            + second
+            + b"b" * (2 * 1024 * 1024)
+            + f"\r\n--{boundary}--\r\n".encode()
+        )
+
+        async def chunks():
+            for offset in range(0, len(body), 64 * 1024):
+                yield body[offset : offset + 64 * 1024]
+
+        response = await self.client.post(
+            "/v1/pebble",
+            data=chunks(),
+            headers={
+                "Authorization": f"Bearer {RING}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        self.assertEqual(response.status, 413)
+        self.assertEqual((await response.json())["error"]["code"], "request_too_large")
         self.assertEqual(self.forwarder.calls, [])
 
     async def test_missing_secrets_fail_closed(self):
@@ -448,6 +676,26 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[redacted]", text)
         self.assertNotIn(AUDIO.decode(), text)
         self.assertNotIn("secret-free transcript", text)
+
+    async def test_event_ids_are_escaped_before_logging(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("homelab-functions")
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        logger.addHandler(handler)
+        try:
+            event_id = "line-one\nforged-entry"
+            forwarded = await self.post_json(self.json_body(event_id=event_id))
+            duplicate = await self.post_json(self.json_body(event_id=event_id))
+            self.assertEqual(forwarded.status, 200)
+            self.assertTrue((await duplicate.json())["duplicate"])
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous)
+        text = stream.getvalue()
+        self.assertEqual(text.count(r'event_id="line-one\nforged-entry"'), 2)
+        self.assertNotIn("event_id=line-one\nforged-entry", text)
 
     async def test_real_forwarder_posts_json_with_bearer_and_no_audio(self):
         captured = {}

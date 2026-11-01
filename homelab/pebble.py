@@ -35,12 +35,28 @@ DEFAULT_AUDIO_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_STT_URL = "https://api.x.ai/v1/stt"
 DEFAULT_STT_MODEL = "grok-voice-transcribe-2.0"
 MAX_AUDIO_BYTES = 8 * 1024 * 1024
+MAX_PEBBLE_BODY_BYTES = 9 * 1024 * 1024
 MAX_TEXT_FIELD_BYTES = 64 * 1024
 MAX_TEXT_FIELDS = 32
 MAX_EVENT_ID_LENGTH = 200
+EVENT_FRESHNESS_WINDOW = timedelta(minutes=5)
 
 _AUTHORIZATION_RE = re.compile(r"(?i)(authorization:\s*bearer\s+)\S+")
 _BEARER_PREFIX = "Bearer "
+_FORWARDED_SOURCE_FIELDS = frozenset(
+    {
+        "audio_duration_seconds",
+        "client",
+        "event_id",
+        "event_type",
+        "recordedAt",
+        "test",
+        "timestamp",
+        "transcript",
+        "transcription",
+        "trigger",
+    }
+)
 
 
 class PebbleRequestError(Exception):
@@ -147,7 +163,15 @@ def timestamp_from_recorded_at(value: str) -> str:
             "recordedAt must be unix milliseconds",
             detail="recordedAt",
         )
-    moment = datetime.fromtimestamp(milliseconds / 1000, timezone.utc)
+    try:
+        moment = datetime.fromtimestamp(milliseconds / 1000, timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise PebbleRequestError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            "recordedAt must be unix milliseconds",
+            detail="recordedAt",
+        ) from exc
     return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
@@ -249,34 +273,33 @@ class PebbleLedger:
             connection.close()
 
     def claim(self, event_id: str) -> str:
-        """Return ``new``, ``retry``, or ``duplicate``.
+        """Return ``new``, ``in_progress``, or ``duplicate``.
 
-        ``retry`` means a previous attempt stored the id and then died before
-        the forward was marked. The caller forwards again.
+        Pending rows are cleared on process startup, so an existing pending
+        row always belongs to a live request and must not be stolen.
         """
 
-        now = _utc_now()
+        stamp = _utc_now()
         with self._transaction() as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO events (event_id, status, created_at, updated_at)
+                VALUES (?, 'pending', ?, ?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (event_id, stamp, stamp),
+            )
+            if inserted.rowcount == 1:
+                return "new"
             row = connection.execute(
                 "SELECT status FROM events WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
             if row is None:
-                connection.execute(
-                    """
-                    INSERT INTO events (event_id, status, created_at, updated_at)
-                    VALUES (?, 'pending', ?, ?)
-                    """,
-                    (event_id, now, now),
-                )
-                return "new"
+                raise RuntimeError("event claim disappeared")
             if row["status"] == "forwarded":
                 return "duplicate"
-            connection.execute(
-                "UPDATE events SET updated_at = ? WHERE event_id = ?",
-                (now, event_id),
-            )
-            return "retry"
+            return "in_progress"
 
     def mark_forwarded(self, event_id: str) -> None:
         with self._transaction() as connection:
@@ -291,6 +314,10 @@ class PebbleLedger:
                 "DELETE FROM events WHERE event_id = ? AND status = 'pending'",
                 (event_id,),
             )
+
+    def release_pending(self) -> None:
+        with self._transaction() as connection:
+            connection.execute("DELETE FROM events WHERE status = 'pending'")
 
     def store_audio(self, event_id: str, audio: bytes, *, ttl_seconds: int, now: datetime) -> Path:
         root = Path(self.audio_dir).resolve()
@@ -465,13 +492,16 @@ class XaiSpeechTranscriber:
 
 
 def prepare_pebble_storage(ledger_path: str, audio_dir: str) -> None:
-    """Drop expired audio when the process starts and a ledger is already present."""
+    """Recover interrupted claims and drop expired audio on process startup."""
 
     if Path(ledger_path).exists():
-        PebbleLedger(ledger_path, audio_dir).cleanup_expired(datetime.now(timezone.utc))
+        ledger = PebbleLedger(ledger_path, audio_dir)
+        ledger.release_pending()
+        ledger.cleanup_expired(datetime.now(timezone.utc))
 
 
 async def read_pebble_request(request: Any) -> tuple[dict[str, Any], bytes | None, str, str]:
+    _ensure_request_body_within_limit(request)
     content_type = request.content_type
     if content_type == "application/json":
         return await _read_json(request)
@@ -512,10 +542,10 @@ async def relay_event(
             "GROK_PEBBLE_WEBHOOK_KEY is not configured",
         )
 
-    now = datetime.now(timezone.utc)
-    ledger.cleanup_expired(now)
+    ledger.cleanup_expired(datetime.now(timezone.utc))
     fields, audio, filename, content_type = await read_pebble_request(request)
-    event = _normalize(fields, audio, request.headers)
+    now = datetime.now(timezone.utc)
+    event = _normalize(fields, audio, request.headers, now=now)
     needs_transcript = event["transcript"] is None
     if needs_transcript and audio is None:
         raise PebbleRequestError(
@@ -531,18 +561,25 @@ async def relay_event(
             "XAI_API_KEY is not configured",
         )
     duration = None if needs_transcript else _parse_duration(fields.get("audio_duration_seconds"))
-    if audio is not None:
-        ledger.store_audio(
-            event["event_id"],
-            audio,
-            ttl_seconds=settings.audio_ttl_seconds,
-            now=now,
-        )
     claim = ledger.claim(event["event_id"])
     if claim == "duplicate":
-        LOGGER.info("pebble relay duplicate event_id=%s", event["event_id"])
+        LOGGER.info("pebble relay duplicate event_id=%s", _escaped_log_value(event["event_id"]))
         return {"status": "duplicate", "event_id": event["event_id"], "duplicate": True}
+    if claim == "in_progress":
+        raise PebbleRequestError(
+            HTTPStatus.CONFLICT,
+            "event_in_progress",
+            "A Pebble event with this id is already being processed",
+            detail="event_id",
+        )
     try:
+        if audio is not None:
+            ledger.store_audio(
+                event["event_id"],
+                audio,
+                ttl_seconds=settings.audio_ttl_seconds,
+                now=now,
+            )
         transcript_text = event["transcript"]
         if needs_transcript:
             active = transcriber or XaiSpeechTranscriber(
@@ -559,11 +596,17 @@ async def relay_event(
         ledger.release(event["event_id"])
         raise
     ledger.mark_forwarded(event["event_id"])
-    LOGGER.info("pebble relay forwarded event_id=%s", event["event_id"])
+    LOGGER.info("pebble relay forwarded event_id=%s", _escaped_log_value(event["event_id"]))
     return {"status": "forwarded", "event_id": event["event_id"], "duplicate": False}
 
 
-def _normalize(fields: dict[str, Any], audio: bytes | None, headers: Any) -> dict[str, Any]:
+def _normalize(
+    fields: dict[str, Any],
+    audio: bytes | None,
+    headers: Any,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
     event_type = fields.get("event_type") or fields.get("trigger") or headers.get("X-Index-Trigger")
     if not isinstance(event_type, str):
         raise PebbleRequestError(
@@ -601,6 +644,11 @@ def _normalize(fields: dict[str, Any], audio: bytes | None, headers: Any) -> dic
         if isinstance(recorded_at, str)
         else normalize_timestamp(timestamp_field or "")
     )
+    _validate_event_freshness(
+        timestamp,
+        now=now,
+        detail="recordedAt" if recorded_at is not None else "timestamp",
+    )
     explicit_id = fields.get("event_id") or headers.get("X-Index-Delivery")
     if explicit_id is not None:
         if not isinstance(explicit_id, str):
@@ -636,7 +684,7 @@ def _forward_payload(
     duration: float | None,
     fields: dict[str, Any],
 ) -> dict[str, Any]:
-    original = {key: value for key, value in fields.items()}
+    original = {key: value for key, value in fields.items() if key in _FORWARDED_SOURCE_FIELDS}
     payload: dict[str, Any] = {
         "event_id": event["event_id"],
         "event_type": event["event_type"],
@@ -651,6 +699,21 @@ def _forward_payload(
     return payload
 
 
+def _validate_event_freshness(timestamp: str, *, now: datetime, detail: str) -> None:
+    moment = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    if moment < now - EVENT_FRESHNESS_WINDOW or moment > now + EVENT_FRESHNESS_WINDOW:
+        raise PebbleRequestError(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            "event timestamp is outside the freshness window",
+            detail=detail,
+        )
+
+
+def _escaped_log_value(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True)
+
+
 async def _read_json(request: Any) -> tuple[dict[str, Any], None, str, str]:
     try:
         payload = await request.json()
@@ -660,6 +723,7 @@ async def _read_json(request: Any) -> tuple[dict[str, Any], None, str, str]:
             "invalid_request",
             "Request body must be a JSON object",
         ) from exc
+    _ensure_request_body_within_limit(request)
     if not isinstance(payload, dict):
         raise PebbleRequestError(
             HTTPStatus.BAD_REQUEST,
@@ -715,6 +779,7 @@ async def _read_multipart(request: Any) -> tuple[dict[str, Any], bytes | None, s
     content_type = "audio/mp4"
     reader = await request.multipart()
     while True:
+        _ensure_request_body_within_limit(request)
         part = await reader.next()
         if part is None:
             break
@@ -733,11 +798,12 @@ async def _read_multipart(request: Any) -> tuple[dict[str, Any], bytes | None, s
                     "Only the audio file part is accepted",
                     detail=name or "file",
                 )
-            audio = await _read_limited(part, MAX_AUDIO_BYTES, "audio")
+            audio = await _read_limited(part, MAX_AUDIO_BYTES, "audio", request=request)
             filename = Path(part.filename or "recording.m4a").name or "recording.m4a"
             content_type = part.headers.get("Content-Type", "audio/mp4").split(";", 1)[0].strip()
             continue
-        raw = await _read_limited(part, MAX_TEXT_FIELD_BYTES, name or "field")
+        raw = await _read_limited(part, MAX_TEXT_FIELD_BYTES, name or "field", request=request)
+        _ensure_request_body_within_limit(request)
         try:
             fields[name] = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -752,13 +818,14 @@ async def _read_multipart(request: Any) -> tuple[dict[str, Any], bytes | None, s
     return fields, audio, filename, content_type or "audio/mp4"
 
 
-async def _read_limited(part: Any, limit: int, field: str) -> bytes:
+async def _read_limited(part: Any, limit: int, field: str, *, request: Any) -> bytes:
     chunks: list[bytes] = []
     size = 0
     while True:
         chunk = await part.read_chunk(64 * 1024)
         if not chunk:
             break
+        _ensure_request_body_within_limit(request)
         size += len(chunk)
         if size > limit:
             code_status = HTTPStatus.REQUEST_ENTITY_TOO_LARGE if field == "audio" else HTTPStatus.BAD_REQUEST
@@ -770,6 +837,19 @@ async def _read_limited(part: Any, limit: int, field: str) -> bytes:
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _ensure_request_body_within_limit(request: Any) -> None:
+    content_length = request.content_length
+    received = getattr(request.content, "total_bytes", 0)
+    if (content_length is not None and content_length > MAX_PEBBLE_BODY_BYTES) or (
+        received > MAX_PEBBLE_BODY_BYTES
+    ):
+        raise PebbleRequestError(
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            "request_too_large",
+            "Pebble request body is too large",
+        )
 
 
 def _unlink_audio(path_text: str, root: Path) -> None:

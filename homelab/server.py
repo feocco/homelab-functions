@@ -31,7 +31,7 @@ from .pebble import (
     DEFAULT_AUDIO_TTL_SECONDS,
     DEFAULT_GROK_PEBBLE_WEBHOOK_URL,
     DEFAULT_STT_MODEL,
-    MAX_AUDIO_BYTES,
+    MAX_PEBBLE_BODY_BYTES,
     PebbleLedger,
     PebbleRequestError,
     PebbleSettings,
@@ -578,7 +578,7 @@ def create_app(
         config.ha_long_lived_token,
     )
     prepare_pebble_storage(config.pebble_ledger_path, config.pebble_audio_dir)
-    app = web.Application(client_max_size=MAX_AUDIO_BYTES + 1024 * 1024)
+    app = web.Application()
     app[CONFIG_KEY] = config
     app[HA_CLIENT_KEY] = ha_client or HomeAssistantClient(config)
     app[LEDGER_KEY] = ledger or NotificationLedger(config.notification_ledger_path)
@@ -639,12 +639,19 @@ async def stop_action_recorder(app: web.Application) -> None:
 async def relay_pebble(request: web.Request) -> web.Response:
     config = request.app[CONFIG_KEY]
     try:
+        limited_request = request.clone(client_max_size=MAX_PEBBLE_BODY_BYTES)
         result = await relay_event(
-            request,
+            limited_request,
             settings=PebbleSettings.from_config(config),
             ledger=_pebble_ledger(request),
             forwarder=request.app.get(PEBBLE_FORWARDER_KEY) or _default_pebble_forwarder(config),
             transcriber=request.app.get(PEBBLE_TRANSCRIBER_KEY),
+        )
+    except web.HTTPRequestEntityTooLarge:
+        return error_response(
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            "request_too_large",
+            "Pebble request body is too large",
         )
     except PebbleRequestError as exc:
         LOGGER.warning("pebble relay rejected code=%s", exc.code)
