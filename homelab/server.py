@@ -17,6 +17,7 @@ from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 from .access import (
     ACCESS_VECTOR,
     ERROR_RESPONSE_SCHEMA,
+    HTTP_ONLY_OPERATIONS,
     PUBLIC_ENDPOINTS,
     AccessOperation,
     AccessParameter,
@@ -26,6 +27,18 @@ from .action_recorder import NotificationActionRecorder
 from .docs_page import DOCS_HEADERS, service_docs_html
 from .home_assistant import HomeAssistantConfig
 from .notification_ledger import NotificationLedger
+from .pebble import (
+    DEFAULT_AUDIO_TTL_SECONDS,
+    DEFAULT_GROK_PEBBLE_WEBHOOK_URL,
+    DEFAULT_STT_MODEL,
+    MAX_AUDIO_BYTES,
+    PebbleLedger,
+    PebbleRequestError,
+    PebbleSettings,
+    install_secret_redaction,
+    prepare_pebble_storage,
+    relay_event,
+)
 
 
 LOGGER = logging.getLogger("homelab-functions")
@@ -74,6 +87,14 @@ class Config:
     notification_action_recorder_enabled: bool = True
     homelab_catalog_path: str = "/app/config/service-catalog.json"
     homelab_smoke_signal_targets_path: str = "/app/config/smoke-signal-targets.json"
+    pebble_ring_token: str = ""
+    grok_pebble_webhook_url: str = DEFAULT_GROK_PEBBLE_WEBHOOK_URL
+    grok_pebble_webhook_key: str = ""
+    xai_api_key: str = ""
+    xai_stt_model: str = DEFAULT_STT_MODEL
+    pebble_ledger_path: str = "/app/data/pebble-events.sqlite3"
+    pebble_audio_dir: str = "/app/data/pebble-audio"
+    pebble_audio_ttl_seconds: int = DEFAULT_AUDIO_TTL_SECONDS
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -114,6 +135,18 @@ class Config:
                 "HOMELAB_SMOKE_SIGNAL_TARGETS_PATH",
                 "/app/config/smoke-signal-targets.json",
             ),
+            pebble_ring_token=os.environ.get("PEBBLE_RING_TOKEN", ""),
+            grok_pebble_webhook_url=os.environ.get("GROK_PEBBLE_WEBHOOK_URL")
+            or DEFAULT_GROK_PEBBLE_WEBHOOK_URL,
+            grok_pebble_webhook_key=os.environ.get("GROK_PEBBLE_WEBHOOK_KEY", ""),
+            xai_api_key=os.environ.get("XAI_API_KEY", ""),
+            xai_stt_model=os.environ.get("XAI_STT_MODEL") or DEFAULT_STT_MODEL,
+            pebble_ledger_path=os.environ.get(
+                "PEBBLE_LEDGER_PATH",
+                "/app/data/pebble-events.sqlite3",
+            ),
+            pebble_audio_dir=os.environ.get("PEBBLE_AUDIO_DIR", "/app/data/pebble-audio"),
+            pebble_audio_ttl_seconds=_env_int("PEBBLE_AUDIO_TTL_SECONDS", DEFAULT_AUDIO_TTL_SECONDS),
         )
 
 
@@ -198,6 +231,16 @@ def load_dotenv(path: str = ".env") -> None:
                 continue
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
 
 
 def env_bool(name: str, *, default: bool) -> bool:
@@ -410,14 +453,25 @@ def service_openapi() -> dict[str, Any]:
             "version": "0.1.0",
             "description": "Notification and homelab API service for stable reusable actions.",
         },
-        "tags": [{"name": domain} for domain in ACCESS_VECTOR.domains()],
+        "tags": [
+            {"name": domain}
+            for domain in (*ACCESS_VECTOR.domains(), *(op.domain for op in HTTP_ONLY_OPERATIONS))
+        ],
         "components": {
             "securitySchemes": {
                 "bearerAuth": {
                     "type": "http",
                     "scheme": "bearer",
                     "description": "Use HOMELAB_FUNCTIONS_TOKEN. Browser docs intentionally do not store tokens.",
-                }
+                },
+                "pebbleRingAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": (
+                        "Use PEBBLE_RING_TOKEN. This token is not HOMELAB_FUNCTIONS_TOKEN "
+                        "and does not authorize any other route."
+                    ),
+                },
             },
             "schemas": _component_schemas(),
         },
@@ -438,6 +492,9 @@ def service_openapi() -> dict[str, Any]:
     for operation in ACCESS_VECTOR:
         path_item = document["paths"].setdefault(operation.path, {})
         path_item[operation.method.lower()] = _openapi_operation(operation)
+    for operation in HTTP_ONLY_OPERATIONS:
+        path_item = document["paths"].setdefault(operation.path, {})
+        path_item[operation.method.lower()] = operation.openapi_operation()
     return document
 
 
@@ -446,6 +503,9 @@ HA_CLIENT_KEY = web.AppKey("ha_client", HomeAssistantClient)
 LEDGER_KEY = web.AppKey("notification_ledger", NotificationLedger)
 ACTION_RECORDER_KEY = web.AppKey("notification_action_recorder", NotificationActionRecorder)
 ACTION_RECORDER_TASK_KEY = web.AppKey("notification_action_recorder_task", asyncio.Task[None])
+PEBBLE_STATE_KEY = web.AppKey("pebble_state", dict)
+PEBBLE_FORWARDER_KEY = web.AppKey("pebble_forwarder", object)
+PEBBLE_TRANSCRIBER_KEY = web.AppKey("pebble_transcriber", object)
 
 
 def _bearer_protected(handler):
@@ -506,8 +566,19 @@ def create_app(
     config: Config,
     ha_client: HomeAssistantClient | None = None,
     ledger: NotificationLedger | None = None,
+    *,
+    pebble_forwarder: Any | None = None,
+    pebble_transcriber: Any | None = None,
 ) -> web.Application:
-    app = web.Application()
+    install_secret_redaction(
+        config.homelab_functions_token,
+        config.pebble_ring_token,
+        config.grok_pebble_webhook_key,
+        config.xai_api_key,
+        config.ha_long_lived_token,
+    )
+    prepare_pebble_storage(config.pebble_ledger_path, config.pebble_audio_dir)
+    app = web.Application(client_max_size=MAX_AUDIO_BYTES + 1024 * 1024)
     app[CONFIG_KEY] = config
     app[HA_CLIENT_KEY] = ha_client or HomeAssistantClient(config)
     app[LEDGER_KEY] = ledger or NotificationLedger(config.notification_ledger_path)
@@ -522,9 +593,28 @@ def create_app(
         )
         app.on_startup.append(start_action_recorder)
         app.on_cleanup.append(stop_action_recorder)
+    app[PEBBLE_STATE_KEY] = {"ledger": None}
+    if pebble_forwarder is not None:
+        app[PEBBLE_FORWARDER_KEY] = pebble_forwarder
+    if pebble_transcriber is not None:
+        app[PEBBLE_TRANSCRIBER_KEY] = pebble_transcriber
     _register_public_routes(app)
     _register_protected_routes(app)
+    _register_http_only_routes(app)
     return app
+
+
+def _register_http_only_routes(app: web.Application) -> None:
+    handlers = {"relay_pebble": relay_pebble}
+    declared = {operation.operation_id for operation in HTTP_ONLY_OPERATIONS}
+    if set(handlers) != declared:
+        missing = ", ".join(sorted(declared - set(handlers)))
+        extra = ", ".join(sorted(set(handlers) - declared))
+        raise RuntimeError(
+            f"HTTP-only handlers do not match HTTP_ONLY_OPERATIONS. missing=[{missing}] extra=[{extra}]"
+        )
+    for operation in HTTP_ONLY_OPERATIONS:
+        app.router.add_route(operation.method, operation.path, handlers[operation.operation_id])
 
 
 async def start_action_recorder(app: web.Application) -> None:
@@ -544,6 +634,39 @@ async def stop_action_recorder(app: web.Application) -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+async def relay_pebble(request: web.Request) -> web.Response:
+    config = request.app[CONFIG_KEY]
+    try:
+        result = await relay_event(
+            request,
+            settings=PebbleSettings.from_config(config),
+            ledger=_pebble_ledger(request),
+            forwarder=request.app.get(PEBBLE_FORWARDER_KEY) or _default_pebble_forwarder(config),
+            transcriber=request.app.get(PEBBLE_TRANSCRIBER_KEY),
+        )
+    except PebbleRequestError as exc:
+        LOGGER.warning("pebble relay rejected code=%s", exc.code)
+        return error_response(exc.status, exc.code, str(exc), detail=exc.detail)
+    return web.json_response(result)
+
+
+def _pebble_ledger(request: web.Request) -> PebbleLedger:
+    state = request.app[PEBBLE_STATE_KEY]
+    ledger = state.get("ledger")
+    if isinstance(ledger, PebbleLedger):
+        return ledger
+    config = request.app[CONFIG_KEY]
+    ledger = PebbleLedger(config.pebble_ledger_path, config.pebble_audio_dir)
+    state["ledger"] = ledger
+    return ledger
+
+
+def _default_pebble_forwarder(config: Config):
+    from .pebble import AiohttpJsonForwarder
+
+    return AiohttpJsonForwarder(config.request_timeout_seconds)
 
 
 async def docs(_request: web.Request) -> web.Response:

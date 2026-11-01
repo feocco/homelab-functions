@@ -136,7 +136,31 @@ targets = homelab.get_smoke_signal_targets()["targets"]
 ```
 
 `homelab-config` generates both files. The server only authenticates and
-returns them.
+returns them. `GET /docs` is the page the catalog links as this service's
+docs.
+
+### Relay a Pebble Index recording
+
+The phone posts to `POST /v1/pebble`. This route is HTTP-only. It is not a
+Python helper and not an MCP tool. Set the Pebble app webhook URL to:
+
+`https://homelab-functions.home.feocco.com/v1/pebble`
+
+Send `Authorization: Bearer $PEBBLE_RING_TOKEN`. That token is not
+`HOMELAB_FUNCTIONS_TOKEN`. A transcription-only JSON body looks like this:
+
+```bash
+curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \
+  -H "Authorization: Bearer $PEBBLE_RING_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"ring-event-1","event_type":"single-click-hold","recordedAt":"1790037251116","transcription":"Turn the lights off","client":"ring"}'
+```
+
+The server forwards JSON, including `event_id`, `event_type`, `timestamp`,
+`transcript`, `audio_duration_seconds`, and the original text fields. It does
+not forward the audio file. See
+[Pebble ring relay](docs/architecture.md#pebble-ring-relay) for the tailnet
+fallback and the homelab-config secret follow-up.
 
 ### Use the MCP server or Cursor plugin
 
@@ -172,6 +196,7 @@ shows the full API.
 
 Protected actions are declared in `homelab.access.ACCESS_VECTOR`. The routes,
 OpenAPI document, client methods, MCP tools, and `/docs` page all come from it.
+`POST /v1/pebble` is the HTTP-only exception in `HTTP_ONLY_OPERATIONS`.
 These routes are public:
 
 - `GET /health`
@@ -197,7 +222,20 @@ NOTIFICATION_LEDGER_PATH=/app/data/notifications.sqlite3
 NOTIFICATION_ACTION_RECORDER_ENABLED=true
 HOMELAB_CATALOG_PATH=/app/config/service-catalog.json
 HOMELAB_SMOKE_SIGNAL_TARGETS_PATH=/app/config/smoke-signal-targets.json
+PEBBLE_RING_TOKEN=replace_me
+GROK_PEBBLE_WEBHOOK_KEY=replace_me
+GROK_PEBBLE_WEBHOOK_URL=https://api2.cursor.sh/automations/webhook/e3f09362-8a64-5de6-989c-c5d4b75e6238
+XAI_API_KEY=
+XAI_STT_MODEL=grok-voice-transcribe-2.0
+PEBBLE_LEDGER_PATH=/app/data/pebble-events.sqlite3
+PEBBLE_AUDIO_DIR=/app/data/pebble-audio
+PEBBLE_AUDIO_TTL_SECONDS=86400
 ```
+
+`PEBBLE_RING_TOKEN` and `GROK_PEBBLE_WEBHOOK_KEY` are required before the
+ring route will forward. `GROK_PEBBLE_WEBHOOK_URL` defaults to the Cursor
+webhook above when unset. `XAI_API_KEY` is required only when audio arrives
+without a transcription. The other pebble variables have the defaults shown.
 
 Python client and MCP server:
 

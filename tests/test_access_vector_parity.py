@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 from aiohttp.test_utils import TestClient, TestServer
 
 import homelab
-from homelab.access import ACCESS_VECTOR
+from homelab.access import ACCESS_VECTOR, HTTP_ONLY_OPERATIONS, PEBBLE_PHONE_URL, PEBBLE_TAILNET_HTTP_URL
 from homelab.client import HomelabFunctionsClient, HomelabFunctionsError
 from homelab.consumers import CONSUMERS, consumer_matrix_markdown
 from homelab.server import Config, HomeAssistantError, create_app
@@ -231,6 +231,7 @@ EXPECTED_ROUTES = (
     ("POST", "/v1/workflow-reports"),
     ("GET", "/v1/workflow-reports"),
     ("GET", "/v1/workflow-reports/{report_id}"),
+    ("POST", "/v1/pebble"),
 )
 
 PUBLIC_EXPORTS = [
@@ -392,6 +393,25 @@ class ContractTests(unittest.TestCase):
                 [(error["status"], error["description"]) for error in expected["errors"]],
             )
 
+    def test_pebble_route_stays_out_of_the_shared_registry(self):
+        self.assertEqual(tuple(operation.operation_id for operation in HTTP_ONLY_OPERATIONS), ("relay_pebble",))
+        operation = HTTP_ONLY_OPERATIONS[0]
+        self.assertEqual((operation.method, operation.path), ("POST", "/v1/pebble"))
+        self.assertEqual(operation.auth_env, "PEBBLE_RING_TOKEN")
+        self.assertEqual(operation.auth_scheme, "pebbleRingAuth")
+        self.assertIn("PEBBLE_RING_TOKEN", operation.exclusion_reason)
+        self.assertIn("multipart", operation.exclusion_reason)
+        self.assertNotIn(operation.operation_id, {item.operation_id for item in ACCESS_VECTOR})
+        self.assertNotIn((operation.method, operation.path), {(item.method, item.path) for item in ACCESS_VECTOR})
+        documented = operation.openapi_operation()
+        self.assertEqual(documented["security"], [{"pebbleRingAuth": []}])
+        self.assertNotIn(
+            "audio",
+            documented["requestBody"]["content"]["application/json"]["schema"]["properties"],
+        )
+        self.assertEqual(PEBBLE_PHONE_URL, "https://homelab-functions.home.feocco.com/v1/pebble")
+        self.assertEqual(PEBBLE_TAILNET_HTTP_URL, "http://100.81.237.11:8091/v1/pebble")
+
     def test_protected_routes_match_contract(self):
         with TemporaryDirectory() as tmp:
             app = create_app(write_runtime(Path(tmp)), ha_client=FakeHomeAssistant())
@@ -414,6 +434,8 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(list(homelab.__all__), PUBLIC_EXPORTS)
         for name in PUBLIC_EXPORTS:
             self.assertIsNotNone(getattr(homelab, name))
+        self.assertFalse(hasattr(HomelabFunctionsClient, "relay_pebble"))
+        self.assertNotIn("relay_pebble", homelab.__all__)
         for operation in ACCESS_VECTOR:
             method = getattr(HomelabFunctionsClient, operation.operation_id)
             self.assertTrue(callable(method))
@@ -518,6 +540,8 @@ class ContractTests(unittest.TestCase):
         self.assertIn("name: homelab-functions", frontmatter)
         for operation_id in EXPECTED_IDS:
             self.assertIn(operation_id, body)
+        self.assertIn("PEBBLE_RING_TOKEN", body)
+        self.assertIn("not an MCP tool", body)
         self.assertIn("HomeAssistantWebSocketClient", body)
         self.assertIn("state", body)
         self.assertIn("events", body)
@@ -953,7 +977,8 @@ class OpenAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("/docs", payload["paths"])
         self.assertEqual(
             payload["tags"],
-            [{"name": domain} for domain in dict.fromkeys(item["domain"] for item in CONTRACTS)],
+            [{"name": domain} for domain in dict.fromkeys(item["domain"] for item in CONTRACTS)]
+            + [{"name": "Pebble"}],
         )
 
         found = []
@@ -963,7 +988,8 @@ class OpenAPITests(unittest.IsolatedAsyncioTestCase):
                     found.append((operation["operationId"], method.upper(), path))
         self.assertEqual(
             found,
-            [(item["operation_id"], item["method"], item["path"]) for item in CONTRACTS],
+            [(item["operation_id"], item["method"], item["path"]) for item in CONTRACTS]
+            + [("relay_pebble", "POST", "/v1/pebble")],
         )
 
         for expected in CONTRACTS:
@@ -990,6 +1016,14 @@ class OpenAPITests(unittest.IsolatedAsyncioTestCase):
             body_schema(contract_by_id("record_workflow_report")["parameters"]),
         )
         self.assertIn("ErrorResponse", schemas)
+        pebble = payload["paths"]["/v1/pebble"]["post"]
+        self.assertEqual(pebble["operationId"], "relay_pebble")
+        self.assertEqual(pebble["security"], [{"pebbleRingAuth": []}])
+        self.assertTrue(pebble["x-homelab-http-only"])
+        self.assertEqual(pebble["x-homelab-auth-env"], "PEBBLE_RING_TOKEN")
+        self.assertNotIn("audio", pebble["requestBody"]["content"]["application/json"]["schema"]["properties"])
+        self.assertIn("audio", pebble["requestBody"]["content"]["multipart/form-data"]["schema"]["properties"])
+        self.assertIn("pebbleRingAuth", payload["components"]["securitySchemes"])
         assert_omits_additional_properties(self, payload)
 
         docs = await self.http.get("/docs")
@@ -1232,6 +1266,7 @@ class EndToEndTests(unittest.TestCase):
         listed = self.rpc("tools/list")
         tools = listed["result"]["tools"]
         self.assertEqual([tool["name"] for tool in tools], list(EXPECTED_IDS))
+        self.assertNotIn("relay_pebble", [tool["name"] for tool in tools])
         for tool, expected in zip(tools, CONTRACTS, strict=True):
             self.assertEqual(tool["name"], expected["operation_id"])
             self.assertEqual(tool["description"], expected["description"])
@@ -1734,7 +1769,7 @@ class ServiceDocsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN", self.body)
 
     def test_every_registry_operation_has_a_complete_card(self):
-        self.assertEqual(tuple(self.cards), EXPECTED_IDS)
+        self.assertEqual(tuple(self.cards), EXPECTED_IDS + ("relay_pebble",))
         for expected in CONTRACTS:
             card = self.cards[expected["operation_id"]]
             text = card.text()
@@ -1779,6 +1814,15 @@ class ServiceDocsTests(unittest.IsolatedAsyncioTestCase):
             for error in expected["errors"]:
                 self.assertIn(error["description"], statuses[error["status"]])
                 self.assertIn("ErrorResponse", statuses[error["status"]])
+        pebble = self.cards["relay_pebble"]
+        self.assertEqual(pebble.attrs["data-http-only"], "true")
+        self.assertEqual(pebble.attrs["data-path"], "/v1/pebble")
+        pebble_text = pebble.text()
+        self.assertIn("PEBBLE_RING_TOKEN", pebble_text)
+        self.assertIn(PEBBLE_PHONE_URL, pebble_text)
+        self.assertIn("Not a client method", pebble_text)
+        self.assertIn("Not a tool", pebble_text)
+        self.assertEqual(pebble.find_all("div", role="tabpanel"), [])
 
     def test_every_operation_shows_three_equivalent_call_shapes(self):
         for operation in ACCESS_VECTOR:

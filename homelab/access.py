@@ -404,3 +404,161 @@ ACCESS_VECTOR = AccessVector(
         ),
     )
 )
+
+
+# Phone-reachable URL for the Pebble app. homelab-config already publishes this
+# hostname: UniFi DNS on the LAN, DNS-only tailnet address off the LAN, Caddy
+# reverse proxy with no Authentik gate. Do not invent a new public name.
+PEBBLE_PHONE_URL = "https://homelab-functions.home.feocco.com/v1/pebble"
+# Existing Tailscale Serve mapping (hosts/macmini/tailscale-serve.yaml).
+PEBBLE_TAILNET_HTTP_URL = "http://100.81.237.11:8091/v1/pebble"
+
+
+@dataclass(frozen=True)
+class HttpOnlyOperation:
+    """A protected `/v1` route that must not join `ACCESS_VECTOR`.
+
+    Membership in `ACCESS_VECTOR` means the shared `HOMELAB_FUNCTIONS_TOKEN`
+    plus a JSON client method and an MCP tool. A route belongs here only when
+    those three projections would be the wrong contract.
+    """
+
+    operation_id: str
+    method: str
+    path: str
+    summary: str
+    description: str
+    domain: str
+    auth_scheme: str
+    auth_env: str
+    exclusion_reason: str
+    errors: tuple[AccessError, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.operation_id:
+            raise ValueError("operation_id is required")
+        if self.auth_scheme == "bearerAuth":
+            raise ValueError(f"{self.operation_id} must not use the shared bearer scheme")
+        if self.auth_env == "HOMELAB_FUNCTIONS_TOKEN":
+            raise ValueError(f"{self.operation_id} must not use the shared broker token")
+        if not self.exclusion_reason:
+            raise ValueError(f"{self.operation_id} must record why it is HTTP-only")
+        if not self.path.startswith("/v1/"):
+            raise ValueError(f"{self.operation_id} must be a protected /v1 path")
+        object.__setattr__(self, "method", self.method.upper())
+        object.__setattr__(self, "errors", tuple(self.errors))
+        statuses = [error.status for error in self.errors]
+        if len(statuses) != len(set(statuses)):
+            raise ValueError(f"Duplicate error status on {self.operation_id}")
+        if "401" not in statuses:
+            raise ValueError(f"{self.operation_id} must document 401")
+
+    def openapi_operation(self) -> dict[str, Any]:
+        responses: dict[str, Any] = {"200": {"description": self.summary}}
+        for error in self.errors:
+            responses[error.status] = {
+                "description": error.description,
+                "content": {
+                    "application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}
+                },
+            }
+        return {
+            "operationId": self.operation_id,
+            "summary": self.summary,
+            "description": self.description,
+            "tags": [self.domain],
+            "security": [{self.auth_scheme: []}],
+            "x-homelab-http-only": True,
+            "x-homelab-auth-env": self.auth_env,
+            "x-homelab-exclusion": self.exclusion_reason,
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "multipart/form-data": {"schema": _PEBBLE_MULTIPART_SCHEMA},
+                    "application/json": {"schema": _PEBBLE_JSON_SCHEMA},
+                },
+            },
+            "responses": responses,
+        }
+
+
+_PEBBLE_TEXT_PROPERTIES: dict[str, Any] = {
+    "transcription": {"type": "string"},
+    "recordedAt": {"type": "string"},
+    "client": {"type": "string"},
+    "test": {"type": "string"},
+    "event_id": {"type": "string"},
+    "event_type": {"type": "string"},
+    "trigger": {"type": "string"},
+    "timestamp": {"type": "string"},
+    "transcript": {"type": "string"},
+    "audio_duration_seconds": {"type": "number"},
+}
+_PEBBLE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": _PEBBLE_TEXT_PROPERTIES,
+}
+_PEBBLE_MULTIPART_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "audio": {
+            "type": "string",
+            "format": "binary",
+            "description": "AAC audio in an M4A container. Stored locally until TTL. Never forwarded.",
+        },
+        **_PEBBLE_TEXT_PROPERTIES,
+    },
+}
+
+_PEBBLE_EXCLUSION = (
+    "The Pebble ring posts multipart audio and authenticates with PEBBLE_RING_TOKEN. "
+    "ACCESS_VECTOR membership would accept the call with HOMELAB_FUNCTIONS_TOKEN and "
+    "would publish a JSON client method and an MCP tool. The client and MCP speak JSON "
+    "with the shared token, and an MCP tool cannot carry this audio without putting the "
+    "raw recording on the agent path."
+)
+
+HTTP_ONLY_OPERATIONS: tuple[HttpOnlyOperation, ...] = (
+    HttpOnlyOperation(
+        operation_id="relay_pebble",
+        method="POST",
+        path="/v1/pebble",
+        summary="Relay a Pebble Index ring recording",
+        description=(
+            "Accept a Pebble Index webhook (multipart audio or JSON text) and forward JSON "
+            "to the configured Grok webhook. Raw audio stays on this host until its TTL. "
+            f"The phone posts to {PEBBLE_PHONE_URL} with Authorization: Bearer $PEBBLE_RING_TOKEN. "
+            "This route is HTTP-only. It is not a HomelabFunctionsClient method or an MCP tool."
+        ),
+        domain="Pebble",
+        auth_scheme="pebbleRingAuth",
+        auth_env="PEBBLE_RING_TOKEN",
+        exclusion_reason=_PEBBLE_EXCLUSION,
+        errors=(
+            AccessError("400", "Invalid request"),
+            AccessError("401", "Missing or invalid pebble token"),
+            AccessError("413", "Audio payload is too large"),
+            AccessError("415", "Unsupported media type"),
+            AccessError("502", "Transcription or webhook forwarding failed"),
+            AccessError("503", "Pebble relay is not configured"),
+            AccessError("504", "Timed out during transcription or webhook forwarding"),
+        ),
+    ),
+)
+
+
+def _assert_http_only_disjoint() -> None:
+    registry_ids = {operation.operation_id for operation in ACCESS_VECTOR}
+    registry_routes = {(operation.method, operation.path) for operation in ACCESS_VECTOR}
+    seen: set[str] = set()
+    for operation in HTTP_ONLY_OPERATIONS:
+        if operation.operation_id in seen:
+            raise ValueError(f"Duplicate HTTP-only operation_id {operation.operation_id}")
+        seen.add(operation.operation_id)
+        if operation.operation_id in registry_ids:
+            raise ValueError(f"{operation.operation_id} cannot be both registry and HTTP-only")
+        if (operation.method, operation.path) in registry_routes:
+            raise ValueError(f"HTTP-only route collides with ACCESS_VECTOR: {operation.path}")
+
+
+_assert_http_only_disjoint()

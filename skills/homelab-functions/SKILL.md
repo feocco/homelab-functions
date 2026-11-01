@@ -54,6 +54,10 @@ Use `list_workflow_reports` to read recent workflow reports. Filter with `workfl
 
 Use `get_workflow_report` when you already have a report id and need that one record.
 
+## Pebble ring relay
+
+`POST /v1/pebble` is HTTP-only. It is not an MCP tool and not a `HomelabFunctionsClient` method. The Pebble app authenticates with `PEBBLE_RING_TOKEN`. That token is not `HOMELAB_FUNCTIONS_TOKEN`. Do not send ring audio through any other action.
+
 ## Direct Home Assistant access
 
 Use `homelab.HomeAssistantWebSocketClient` when you need live Home Assistant state, events, or service calls. Connect with `HomeAssistantWebSocketClient.from_env()`. Do not add a generic state, event, or service-call route to the homelab-functions server.

@@ -15,7 +15,15 @@ from functools import cache
 from html import escape
 from typing import Any
 
-from .access import ACCESS_VECTOR, ERROR_RESPONSE_SCHEMA, PUBLIC_ENDPOINTS, AccessOperation
+from .access import (
+    ACCESS_VECTOR,
+    ERROR_RESPONSE_SCHEMA,
+    HTTP_ONLY_OPERATIONS,
+    PEBBLE_PHONE_URL,
+    PEBBLE_TAILNET_HTTP_URL,
+    PUBLIC_ENDPOINTS,
+    AccessOperation,
+)
 from .client import DEFAULT_FUNCTIONS_URL
 from .consumers import CONSUMERS, Consumer
 
@@ -527,6 +535,7 @@ def _nav() -> str:
         '<li><a href="#recipes">Recipes</a></li>'
         "</ul>"
         f'<p class="nav-heading">Reference</p><ul>{reference}'
+        '<li><a href="#pebble">Pebble ring</a></li>'
         '<li><a href="#public">Public endpoints</a></li>'
         '<li><a href="#errors">Errors</a></li>'
         "</ul>"
@@ -563,6 +572,89 @@ _UNAUTHORIZED_EXAMPLE = json.dumps(
 )
 
 
+def _pebble_section() -> str:
+    operation = HTTP_ONLY_OPERATIONS[0]
+    example = """curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \\
+  -H "Authorization: Bearer $PEBBLE_RING_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"event_id":"ring-event-1","event_type":"single-click-hold","recordedAt":"1790037251116","transcription":"Turn the lights off","client":"ring"}'"""
+    multipart = """curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \\
+  -H "Authorization: Bearer $PEBBLE_RING_TOKEN" \\
+  -H "X-Index-Trigger: single-click-hold" \\
+  -H "X-Index-Delivery: ring-event-1" \\
+  -F "recordedAt=1790037251116" \\
+  -F "client=ring" \\
+  -F "audio=@clip.m4a;type=audio/mp4" """
+    rows = "".join(
+        f'<tr data-param="{escape(name)}">'
+        + _cell("Name", f"<code><strong>{escape(name)}</strong></code>")
+        + _cell("In", f'<span class="in">in </span>{escape(where)}')
+        + _cell("Type", _code(kind))
+        + _cell("Required", '<span class="pill">optional</span>')
+        + _cell("Constraints", escape(note))
+        + "</tr>"
+        for name, where, kind, note in (
+            ("audio", "multipart file", "binary", "Stored locally until the TTL. Never forwarded."),
+            ("transcription", "text or JSON", "string", "When missing and audio is present, xAI transcribes it."),
+            ("recordedAt", "text or JSON", "string", "Unix milliseconds. One of recordedAt or timestamp is required."),
+            ("timestamp", "text or JSON", "string", "ISO-8601 alternative to recordedAt."),
+            ("event_type", "text, JSON, or X-Index-Trigger", "string", "Gesture, such as single-click-hold."),
+            ("event_id", "text, JSON, or X-Index-Delivery", "string", "Dedupe key. Derived when the phone omits it."),
+            ("client", "text or JSON", "string", "Pebble sends ring."),
+            ("audio_duration_seconds", "text or JSON", "number", "Filled from speech-to-text when audio is transcribed here."),
+        )
+    )
+    statuses = "".join(
+        f'<tr data-status="{escape(error.status)}">'
+        + _cell("Status", f'<span class="status status-{error.status[0]}xx">{escape(error.status)}</span>')
+        + _cell("Meaning", escape(error.description))
+        + _cell("Body", '<a href="#errors"><code>ErrorResponse</code></a>')
+        + "</tr>"
+        for error in operation.errors
+    )
+    return f"""
+<section id="pebble">
+  <p class="eyebrow">Reference</p>
+  <h2>Pebble ring</h2>
+  <p class="lead">HTTP-only device webhook. The ring token cannot call the other routes, and the shared broker token cannot call this one. There is no Python client method and no MCP tool.</p>
+  <article class="op" id="op-{escape(operation.operation_id)}" data-operation="{escape(operation.operation_id)}" data-http-only="true" data-method="{escape(operation.method)}" data-path="{escape(operation.path)}">
+    <div class="op-head">
+      {_method_badge(operation.method)}
+      <code class="path">{_path_html(operation.path)}</code>
+      <a class="anchor" href="#op-{escape(operation.operation_id)}" aria-label="Link to {escape(operation.operation_id)}">#</a>
+    </div>
+    <h3>{escape(operation.summary)}</h3>
+    <p>{escape(operation.description)}</p>
+    <dl class="meta">
+      <div><dt>Operation</dt><dd>{_code(operation.operation_id)}</dd></div>
+      <div><dt>Auth</dt><dd>{_code(operation.auth_env)}</dd></div>
+      <div><dt>Phone URL</dt><dd>{_code(PEBBLE_PHONE_URL)}</dd></div>
+      <div><dt>Tailnet HTTP</dt><dd>{_code(PEBBLE_TAILNET_HTTP_URL)}</dd></div>
+      <div><dt>Python</dt><dd>Not a client method</dd></div>
+      <div><dt>MCP tool</dt><dd>Not a tool</dd></div>
+    </dl>
+    <h4>Parameters</h4>
+    <div class="table-wrap"><table class="stack params">
+      <thead><tr><th>Name</th><th>In</th><th>Type</th><th>Required</th><th>Constraints</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table></div>
+    <h4>Responses</h4>
+    <div class="table-wrap"><table class="stack responses">
+      <thead><tr><th>Status</th><th>Meaning</th><th>Body</th></tr></thead>
+      <tbody>
+        <tr data-status="200">{_cell("Status", '<span class="status status-2xx">200</span>')}{_cell("Meaning", "Forwarded, or a duplicate event id")}{_cell("Body", "JSON")}</tr>
+        {statuses}
+      </tbody>
+    </table></div>
+    <h4>Examples</h4>
+    <p class="muted">JSON when the phone or a test already has text. Multipart when the ring sends audio. The forwarded body is JSON either way.</p>
+    {_code_block(example, "shell", "curl JSON")}
+    {_code_block(multipart, "shell", "curl multipart")}
+  </article>
+</section>
+"""
+
+
 def _main() -> str:
     protected = len(ACCESS_VECTOR)
     return f"""
@@ -570,7 +662,8 @@ def _main() -> str:
   <p class="eyebrow">Start</p>
   <h1>{escape(TITLE)} API reference</h1>
   <p class="lead">{escape(DESCRIPTION)} The broker exposes a fixed set of named actions.
-  Every action has the same three call shapes: HTTP, the Python client, and an MCP tool with the same name.</p>
+  Every action in the access registry has the same three call shapes: HTTP, the Python client, and an MCP tool with the same name.
+  <code>POST /v1/pebble</code> is the exception: an HTTP-only ring webhook documented under Pebble ring.</p>
   <div class="stats">
     <div class="stat"><span class="stat-value">{protected}</span><span class="stat-label">protected actions</span></div>
     <div class="stat"><span class="stat-value">{len(PUBLIC_ENDPOINTS)}</span><span class="stat-label">public endpoints</span></div>
@@ -591,8 +684,10 @@ def _main() -> str:
 <section id="auth">
   <p class="eyebrow">Start</p>
   <h2>Authentication</h2>
-  <p>Every <code>/v1</code> action requires the shared bearer token:</p>
+  <p>Every access-registry <code>/v1</code> action requires the shared bearer token:</p>
   {_code_block("Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN", "http", "header")}
+  <p><code>POST /v1/pebble</code> does not accept that token. The ring uses its own bearer:</p>
+  {_code_block("Authorization: Bearer $PEBBLE_RING_TOKEN", "http", "header")}
   <div class="callout"><strong>This page does not store tokens or run authenticated calls.</strong>
   Its Content-Security-Policy sets <code>connect-src 'none'</code>, so the browser cannot send requests from it.
   Copy an example and run it from a shell, Python, or an MCP client.</div>
@@ -608,7 +703,12 @@ def _main() -> str:
     <thead><tr><th>Variable</th><th>Default</th><th>Notes</th></tr></thead>
     <tbody>
       <tr>{_cell("Variable", _code("HOMELAB_FUNCTIONS_URL"))}{_cell("Default", _code(DEFAULT_FUNCTIONS_URL))}{_cell("Notes", "Containers on the homelab network use " + _code("http://homelab-functions:8091") + ".")}</tr>
-      <tr>{_cell("Variable", _code("HOMELAB_FUNCTIONS_TOKEN"))}{_cell("Default", "None. Required.")}{_cell("Notes", "Must match the server’s " + _code("HOMELAB_FUNCTIONS_TOKEN") + ".")}</tr>
+      <tr>{_cell("Variable", _code("HOMELAB_FUNCTIONS_TOKEN"))}{_cell("Default", "None. Required.")}{_cell("Notes", "Must match the server’s " + _code("HOMELAB_FUNCTIONS_TOKEN") + ". Does not authorize " + _code("POST /v1/pebble") + ".")}</tr>
+      <tr>{_cell("Variable", _code("PEBBLE_RING_TOKEN"))}{_cell("Default", "None. Required for the ring route.")}{_cell("Notes", "Dedicated bearer for " + _code("POST /v1/pebble") + ". Does not authorize any other route.")}</tr>
+      <tr>{_cell("Variable", _code("GROK_PEBBLE_WEBHOOK_KEY"))}{_cell("Default", "None. Required to forward.")}{_cell("Notes", "Bearer sent with the forwarded JSON. Never logged.")}</tr>
+      <tr>{_cell("Variable", _code("GROK_PEBBLE_WEBHOOK_URL"))}{_cell("Default", "Cursor automation webhook")}{_cell("Notes", "JSON-only destination. Raw audio is not sent here.")}</tr>
+      <tr>{_cell("Variable", _code("XAI_API_KEY"))}{_cell("Default", "None.")}{_cell("Notes", "Used only when audio arrives without a transcription.")}</tr>
+      <tr>{_cell("Variable", _code("PEBBLE_AUDIO_TTL_SECONDS"))}{_cell("Default", _code("86400"))}{_cell("Notes", "How long local audio is kept. The event-id dedupe row is kept.")}</tr>
     </tbody>
   </table></div>
   <p>The Cursor plugin starts the MCP server with this <code>mcp.json</code> entry:</p>
@@ -632,6 +732,8 @@ def _main() -> str:
 </section>
 
 {_domain_sections()}
+
+{_pebble_section()}
 
 <section id="public">
   <p class="eyebrow">Reference</p>
@@ -1050,7 +1152,8 @@ def service_docs_html() -> str:
         f'{_THEME_ICON}<span class="sr-only">Toggle light and dark theme</span></button>'
         "</div></div></header>\n"
         f'<div class="layout">{_nav()}<main id="main">{_main()}'
-        "<footer>Generated from <code>homelab.access.ACCESS_VECTOR</code> and "
+        "<footer>Generated from <code>homelab.access.ACCESS_VECTOR</code>, "
+        "<code>homelab.access.HTTP_ONLY_OPERATIONS</code>, and "
         "<code>homelab.consumers.CONSUMERS</code>.</footer>"
         "</main></div>\n</body>\n</html>\n"
     )
