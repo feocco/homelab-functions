@@ -14,6 +14,8 @@ description: >-
 
 `/health`, `/docs`, and `/openapi.json` are public. Every `/v1` action requires `HOMELAB_FUNCTIONS_TOKEN`.
 
+Use the notification group, tag pattern, and action prefix your caller owns in the caller matrix in `docs/architecture.md` or on `GET /docs#callers`. For example, `@Rosie` uses group `rosie` and the `ROSIE_` prefix, and notifies Jess only after Joe confirms.
+
 Do not send Home Assistant state, events, or service calls through this broker. Use `homelab.HomeAssistantWebSocketClient` for `get_states`, event subscriptions, and `call_service`.
 
 ## Notify Joe

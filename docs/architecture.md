@@ -1,103 +1,140 @@
-# homelab-functions Architecture
+# homelab-functions architecture
 
-`homelab-functions` is a small broker for stable homelab actions. It exposes
-named HTTP endpoints for reusable actions and keeps generic Home Assistant
-state, event, and service-call work in client-side helpers.
+This document explains how `homelab-functions` is put together and why. For
+task-oriented steps, see the [README](../README.md). For the full operation
+reference, open `GET /docs` on a running server.
+
+## Named actions, not a proxy
+
+`homelab-functions` is a small broker for stable homelab actions. It exposes a
+fixed list of named HTTP actions, such as `notify_joe`, and nothing else.
+Callers that need Home Assistant state, events, or arbitrary service calls use
+`homelab.HomeAssistantWebSocketClient` in their own process.
+
+That split keeps the deployed server small and keeps the bearer token from
+becoming a master key for Home Assistant. A new action belongs in the broker
+only when several callers need the same stable behavior.
 
 ## Access registry
 
-Protected actions are declared once, in `homelab.access.ACCESS_VECTOR`. The
-registry is an immutable `AccessVector`. Each entry records an operation id,
-HTTP method, path, summary, description, named input parameters, and the
-error responses OpenAPI documents. A parameter has a body, query, or path
-location, required and default metadata, and a JSON schema. An operation can
-name a shared request-body component, such as `NotificationRequest`.
+Every protected action is declared once, in `homelab.access.ACCESS_VECTOR`.
+Each entry records an operation id, HTTP method, `/v1` path, domain, summary,
+description, typed parameters, and documented error statuses. A parameter has
+a body, query, or path location, a JSON schema, and required and default
+metadata. Operations that share a request body name a component, such as
+`NotificationRequest`.
 
-The HTTP routes, OpenAPI operation ids, `HomelabFunctionsClient` methods, and
-MCP tools are built from that registry. `HomelabFunctionsClient` is the
-synchronous Python client. Its constructor takes the service URL, bearer
-token, and timeout.
+These surfaces are generated from that registry:
 
-The stdio MCP server is `python3 -m homelab.mcp_server`. The
-`homelab-functions-mcp` command starts the same server. The Cursor plugin
-manifest `.cursor-plugin/plugin.json` points at `mcp.json` and `skills/`.
-`mcp.json` sets `cwd` to `${CURSOR_PLUGIN_ROOT}` and passes
-`HOMELAB_FUNCTIONS_URL` and `HOMELAB_FUNCTIONS_TOKEN` from the plugin
-variables. `HOMELAB_FUNCTIONS_URL` defaults to `http://127.0.0.1:8091`.
-`HOMELAB_FUNCTIONS_TOKEN` is required.
+- the aiohttp route behind the bearer check
+- the OpenAPI operation at `/openapi.json`, tagged with its domain
+- the `HomelabFunctionsClient` method and the module-level helper
+- the MCP tool served by `python3 -m homelab.mcp_server`
+- the operation card on `GET /docs`, with HTTP, Python, and MCP examples
 
-`/health`, `/docs`, and `/openapi.json` stay public. They are not registry
-entries.
+The plugin skill in `skills/homelab-functions/SKILL.md` names every action.
+`tests/test_access_vector_parity.py` checks all of these surfaces against an
+independent copy of the contract. It also runs each documented example through
+the real client to prove that the three call shapes send the same request.
 
-Use `homelab.HomeAssistantWebSocketClient` for Home Assistant state, events,
-and service calls. Do not add those operations to the broker.
+`/health`, `/docs`, and `/openapi.json` stay public. They are listed in
+`homelab.access.PUBLIC_ENDPOINTS`, not in the registry.
 
-## Notification Flow
+## Callers
 
-Callers send notifications with `notify_joe` or `notify_jess`. The server
-validates the payload, calls the configured Home Assistant notify service, and
-records the sent notification in the shared SQLite ledger.
+`homelab.consumers.CONSUMERS` records who calls which action and which ledger
+keys each caller owns. The same data renders the matrix on `GET /docs`. The
+parity tests check that this table matches it exactly.
 
-The server also runs a background Home Assistant listener for
-`mobile_app_notification_action` and records those events in the ledger. It does
-not execute action-specific behavior. Services that need button callbacks still
-own their own action handling, either through their direct listener fast path or
-by polling the ledger for durable callback records.
+| Caller | Actions | Group | Tags | Action prefixes |
+| --- | --- | --- | --- | --- |
+| `@Rosie` (Grok Bot) | `notify_joe`, `notify_jess` (only after Joe confirmation), `list_notifications` (short-lived reply checks) | `rosie` | `rosie-date-night-*`, `rosie-reminder-*` | `ROSIE_` |
+| `homelab-sre-agent` | `notify_joe`, `record_notification_action`, `list_notifications` | `homelab-sre` | `sre-incident-<id>` | `SRE_APPROVE`, `SRE_IGNORE` |
+| Household/runtime workflows: `cat-food-monitor`, `laundry-monitor`, `plant-monitor`, `bedtime`, `mealie-planner` | `notify_joe`, `notify_jess`, `record_workflow_report`, `workflow_report_button("<workflow-slug>")` | — | — | `WORKFLOW_REPORT` |
+| `smoke-signal` & runtime checkers | `get_service_catalog`, `get_smoke_signal_targets` | — | — | — |
 
-## Workflow Report Flow
+Groups, tags, and action prefixes are conventions for the shared notification
+ledger. The server does not enforce them. They matter because the ledger is
+shared:
 
-Workflow reports are human-submitted incident records for services such as
-`cat-food-monitor`.
+- `list_notifications` filters by `group` and `tag`. A caller that reuses
+  another caller's group reads the wrong replies.
+- The action recorder matches a button press to the latest notification with
+  the same tag. Tags must be unique per conversation, such as one
+  `sre-incident-<id>` per incident.
+- `NotificationActionRouter` dispatches on the prefix before `::`. Two callers
+  with the same prefix would handle each other's buttons.
 
-1. A workflow adds `homelab.workflow_report_button("workflow-slug")` to a mobile
+`workflow_report_button` is a local helper. It builds a Report button with the
+`WORKFLOW_REPORT` prefix and does not call the broker.
+
+## Notification flow
+
+1. A caller sends `notify_joe` or `notify_jess` with a title, message, and
+   optional tag, group, URL, and up to three buttons.
+2. The server validates the payload, calls the configured Home Assistant
+   notify service over WebSocket, and records the notification in the shared
+   SQLite ledger.
+3. Android Companion notifications go out with `ttl: 0` and
+   `priority: high` so Doze does not delay them.
+4. A background listener records every `mobile_app_notification_action` event
+   against the latest notification with a matching tag. It does not run
+   action-specific behavior.
+5. Callers read replies with `list_notifications`, or handle the event in
+   their own listener and store it with `record_notification_action`.
+
+## Workflow report flow
+
+Workflow reports are human-submitted "please investigate" records.
+
+1. A workflow adds `homelab.workflow_report_button("<workflow-slug>")` to a
    notification.
-2. Joe taps Report and submits text through the Home Assistant mobile app.
-3. The workflow's own event listener receives the
+2. Joe taps Report and types what went wrong.
+3. The workflow's own listener receives the
    `mobile_app_notification_action` event.
-4. The workflow calls `record_workflow_report` with the workflow slug, summary
-   text, and optional source, notification id, and raw event data.
-5. `homelab-functions` stores the report with status `reported`.
+4. The workflow calls `record_workflow_report` with the slug, the text, and
+   optional source, notification id, and raw event.
+5. The server stores the report with status `reported`.
 
-V1 records only. It does not start Codex, Cursor, GitHub issue creation, or an
-outbound webhook. This keeps the deployed service reliable and makes the report
-inbox useful before the investigator automation exists.
+Reports are records only. The server does not start Codex, Cursor, GitHub
+issues, or webhooks. A future investigator service can read reports with
+`list_workflow_reports` or `get_workflow_report` and own repository selection,
+sessions, logs, and pull requests.
 
-## Catalog Flow
+## Catalog flow
 
-`homelab-functions` exposes protected catalog reads for services that need a
-runtime view of the homelab without cloning `homelab-config`.
+`homelab-config` generates the service catalog and the Smoke Signal target
+list during deploy and mounts them into the container. `get_service_catalog`
+and `get_smoke_signal_targets` check the bearer token and return the files
+unchanged. Runtime checkers get a cacheable view of the homelab without
+cloning `homelab-config`.
 
-`homelab-config` generates the JSON files during deploy and mounts them into
-the container. `homelab-functions` only checks the bearer token and returns the
-files. `get_service_catalog` and `get_smoke_signal_targets` are the registry
-operations for those reads. Their paths live in `ACCESS_VECTOR`.
+## Security model
 
-This keeps service truth in `homelab-config` while giving small runtime services
-like Smoke Signal a simple API and cacheable payload.
+- Every `/v1` action requires `Authorization: Bearer $HOMELAB_FUNCTIONS_TOKEN`,
+  compared in constant time. Missing or wrong tokens get `401`.
+- The token lives in the server and caller environments. The client, MCP
+  server, plugin manifest, and docs page never embed it. MCP error output
+  redacts it.
+- `GET /docs` sends a Content-Security-Policy with `connect-src 'none'` and
+  hash-pinned inline script and style. The page cannot send requests, so it
+  cannot run authenticated calls or leak a pasted token.
+- The broker has no generic state, event, or service-call route. Adding one
+  would turn the token into Home Assistant admin access.
 
-## Future Investigator Boundary
+## What changes together
 
-The future investigator should be a separate service or agent workflow. It can
-read reports with `list_workflow_reports` or `get_workflow_report`, or from a
-future relay endpoint, and then decide how to start a Codex or Cursor
-investigation.
+Adding or changing a protected action touches all of these in one change:
 
-A future relay event should include:
+1. The `AccessOperation` in `homelab/access.py`, including its domain.
+2. The handler mapping in `homelab/server.py`. The server refuses to start if
+   the mapping and the registry differ.
+3. The `HomelabFunctionsClient` method and module helper in
+   `homelab/client.py`.
+4. The skill entry in `skills/homelab-functions/SKILL.md`.
+5. The contract and behavior tests in `tests/test_access_vector_parity.py`.
+6. A `CONSUMERS` row in `homelab/consumers.py` if a new caller uses it, plus
+   this document's caller matrix.
 
-```json
-{
-  "report_id": 123,
-  "workflow_slug": "cat-food-monitor",
-  "summary": "The morning check did not run.",
-  "created_at": "2026-06-14T12:00:00+00:00",
-  "source": "mobile-action",
-  "notification_id": 456,
-  "links": {
-    "report": "/v1/workflow-reports/123"
-  }
-}
-```
-
-The investigator owns repository selection, branch/session creation, runtime
-logs, and any deployment or pull-request workflow. `homelab-functions` owns only
-the stable intake record and authentication boundary.
+The MCP tool, OpenAPI operation, and `/docs` card follow from the registry
+with no extra code.
