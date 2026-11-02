@@ -17,6 +17,7 @@ from typing import Any
 
 from .access import (
     ACCESS_VECTOR,
+    DASHBOARD_ROUTES,
     ERROR_RESPONSE_SCHEMA,
     HTTP_ONLY_OPERATIONS,
     PEBBLE_PHONE_URL,
@@ -47,6 +48,10 @@ DOMAIN_SUMMARIES = {
     "Workflow reports": (
         "Durable “please investigate” records submitted from a notification’s Report button."
     ),
+    "Waiting on me": (
+        "Joe's action inbox: only the items that need him, read from GitHub through a read-only App, "
+        "plus per-item feedback that goes to one Cursor agent per item. The inbox page shows the same snapshot."
+    ),
 }
 
 EXAMPLE_VALUES: Mapping[str, Any] = {
@@ -66,6 +71,9 @@ EXAMPLE_VALUES: Mapping[str, Any] = {
     "notification_id": 42,
     "workflow": "cat-food-monitor",
     "report_id": 123,
+    "item_id": "feocco/homelab-config#41:secret:3f9a1c2b7d",
+    "feedback": "Use the base64 form of the key in the example.",
+    "request_id": "feedback-2026-11-01-a1",
 }
 _FALLBACK_BY_TYPE: Mapping[str, Any] = {
     "string": "example",
@@ -536,6 +544,7 @@ def _nav() -> str:
         "</ul>"
         f'<p class="nav-heading">Reference</p><ul>{reference}'
         '<li><a href="#pebble">Pebble ring</a></li>'
+        '<li><a href="#dashboard">Waiting on me inbox</a></li>'
         '<li><a href="#public">Public endpoints</a></li>'
         '<li><a href="#errors">Errors</a></li>'
         "</ul>"
@@ -656,6 +665,40 @@ curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \\
 """
 
 
+_APP_KEY_NOTE = (
+    "The App’s RSA private key: PEM, PEM with <code>\\n</code> escapes, or base64 PEM. "
+    "A token with any write permission is refused."
+)
+
+
+def _dashboard_section() -> str:
+    rows = "".join(
+        f'<tr data-dashboard-route="{escape(route.method)} {escape(route.path)}">'
+        + _cell("Method", _method_badge(route.method))
+        + _cell("Path", f"<code>{escape(route.path)}</code>")
+        + _cell("Purpose", escape(route.summary))
+        + _cell("Auth", escape(route.auth))
+        + "</tr>"
+        for route in DASHBOARD_ROUTES
+    )
+    return f"""
+<section id="dashboard">
+  <p class="eyebrow">Reference</p>
+  <h2>Waiting on me inbox</h2>
+  <p class="lead">Joe's action inbox at <code>https://waiting.home.feocco.com</code>, showing the same snapshot that
+  {_op_link("get_waiting_items")} returns. It updates over server-sent events and falls back to polling.</p>
+  <p>The browser signs in once with <code>HOMELAB_FUNCTIONS_TOKEN</code> and keeps a signed, HttpOnly,
+  SameSite=Strict session cookie. That cookie opens only these routes, and the bearer token does not open them.
+  Agents use {_op_link("get_waiting_items")} and {_op_link("send_waiting_feedback")} instead. Only Joe, signed in,
+  can mark an item done, and approve/merge items clear only when merged or closed on GitHub.</p>
+  <div class="table-wrap"><table class="stack">
+    <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Auth</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table></div>
+</section>
+"""
+
+
 def _main() -> str:
     protected = len(ACCESS_VECTOR)
     return f"""
@@ -710,6 +753,10 @@ def _main() -> str:
       <tr>{_cell("Variable", _code("GROK_PEBBLE_WEBHOOK_URL"))}{_cell("Default", "Cursor automation webhook")}{_cell("Notes", "JSON-only destination. Raw audio is not sent here.")}</tr>
       <tr>{_cell("Variable", _code("XAI_API_KEY"))}{_cell("Default", "None.")}{_cell("Notes", "Used only when audio arrives without a transcription.")}</tr>
       <tr>{_cell("Variable", _code("PEBBLE_AUDIO_TTL_SECONDS"))}{_cell("Default", _code("86400"))}{_cell("Notes", "How long local audio is kept. The event-id dedupe row is kept.")}</tr>
+      <tr>{_cell("Variable", _code("DASHBOARD_GH_APP_ID") + ", " + _code("DASHBOARD_GH_APP_INSTALLATION_ID") + ", " + _code("DASHBOARD_GH_OWNER"))}{_cell("Default", "None.")}{_cell("Notes", "Read-only GitHub App for the Waiting on me dashboard.")}</tr>
+      <tr>{_cell("Variable", _code("DASHBOARD_GH_APP_KEY"))}{_cell("Default", "None.")}{_cell("Notes", _APP_KEY_NOTE)}</tr>
+      <tr>{_cell("Variable", _code("CURSOR_API_KEY"))}{_cell("Default", "None. Feedback is off without it.")}{_cell("Notes", "Cursor Cloud Agents API key, sent with Basic auth. Feedback never approves, merges, or deploys.")}</tr>
+      <tr>{_cell("Variable", _code("DASHBOARD_PUBLIC_URL"))}{_cell("Default", _code("https://waiting.home.feocco.com"))}{_cell("Notes", "Its hostname redirects " + _code("/") + " to " + _code("/waiting") + ". HTTPS makes the session cookie Secure.")}</tr>
     </tbody>
   </table></div>
   <p>The Cursor plugin starts the MCP server with this <code>mcp.json</code> entry:</p>
@@ -735,6 +782,8 @@ def _main() -> str:
 {_domain_sections()}
 
 {_pebble_section()}
+
+{_dashboard_section()}
 
 <section id="public">
   <p class="eyebrow">Reference</p>

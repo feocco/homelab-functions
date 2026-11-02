@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9,<4",
+  "cryptography>=42",
 ]
 
 [project.optional-dependencies]
@@ -23,3 +24,6 @@ homelab-functions-mcp = "homelab.mcp_server:main"
 
 [tool.setuptools.packages.find]
 include = ["homelab*"]
+
+[tool.setuptools.package-data]
+homelab = ["static/*"]

@@ -24,9 +24,21 @@ from .access import (
     to_jsonable,
 )
 from .action_recorder import NotificationActionRecorder
+from .cursor_agents import CursorAgentsClient
 from .docs_page import DOCS_HEADERS, service_docs_html
+from .github_waiting import GitHubWaitingSource
 from .home_assistant import HomeAssistantConfig
+from .json_http import AiohttpJsonTransport
 from .notification_ledger import NotificationLedger
+from .waiting import CursorAgents, FeedbackService, FeedbackStore, WaitingBoard, WaitingSource, run_refresh_loop
+from .waiting_web import (
+    BOARD_KEY,
+    FEEDBACK_KEY,
+    SETTINGS_KEY,
+    DashboardSettings,
+    register_dashboard_routes,
+    submit_feedback,
+)
 from .pebble import (
     DEFAULT_AUDIO_TTL_SECONDS,
     DEFAULT_GROK_PEBBLE_WEBHOOK_URL,
@@ -95,6 +107,23 @@ class Config:
     pebble_ledger_path: str = "/app/data/pebble-events.sqlite3"
     pebble_audio_dir: str = "/app/data/pebble-audio"
     pebble_audio_ttl_seconds: int = DEFAULT_AUDIO_TTL_SECONDS
+    dashboard_public_url: str = "https://waiting.home.feocco.com"
+    dashboard_gh_app_id: str = ""
+    dashboard_gh_app_installation_id: str = ""
+    dashboard_gh_owner: str = ""
+    dashboard_gh_app_key: str = ""
+    dashboard_refresh_seconds: int = 60
+    cursor_api_key: str = ""
+    waiting_feedback_path: str = "/app/data/waiting-feedback.sqlite3"
+
+    def dashboard_missing_settings(self) -> list[str]:
+        values = {
+            "DASHBOARD_GH_APP_ID": self.dashboard_gh_app_id,
+            "DASHBOARD_GH_APP_INSTALLATION_ID": self.dashboard_gh_app_installation_id,
+            "DASHBOARD_GH_OWNER": self.dashboard_gh_owner,
+            "DASHBOARD_GH_APP_KEY": self.dashboard_gh_app_key,
+        }
+        return [name for name, value in values.items() if not value]
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -147,7 +176,25 @@ class Config:
             ),
             pebble_audio_dir=os.environ.get("PEBBLE_AUDIO_DIR", "/app/data/pebble-audio"),
             pebble_audio_ttl_seconds=_env_int("PEBBLE_AUDIO_TTL_SECONDS", DEFAULT_AUDIO_TTL_SECONDS),
+            dashboard_public_url=os.environ.get("DASHBOARD_PUBLIC_URL") or "https://waiting.home.feocco.com",
+            dashboard_gh_app_id=os.environ.get("DASHBOARD_GH_APP_ID", "").strip(),
+            dashboard_gh_app_installation_id=os.environ.get("DASHBOARD_GH_APP_INSTALLATION_ID", "").strip(),
+            dashboard_gh_owner=os.environ.get("DASHBOARD_GH_OWNER", "").strip(),
+            dashboard_gh_app_key=os.environ.get("DASHBOARD_GH_APP_KEY", ""),
+            dashboard_refresh_seconds=_dashboard_refresh_seconds(),
+            cursor_api_key=os.environ.get("CURSOR_API_KEY", "").strip(),
+            waiting_feedback_path=os.environ.get(
+                "WAITING_FEEDBACK_PATH",
+                "/app/data/waiting-feedback.sqlite3",
+            ),
         )
+
+
+def _dashboard_refresh_seconds() -> int:
+    seconds = _env_int("DASHBOARD_REFRESH_SECONDS", 60)
+    if seconds < 5:
+        raise ConfigError("DASHBOARD_REFRESH_SECONDS must be at least 5")
+    return seconds
 
 
 class HomeAssistantClient:
@@ -506,6 +553,7 @@ ACTION_RECORDER_TASK_KEY = web.AppKey("notification_action_recorder_task", async
 PEBBLE_STATE_KEY = web.AppKey("pebble_state", dict)
 PEBBLE_FORWARDER_KEY = web.AppKey("pebble_forwarder", object)
 PEBBLE_TRANSCRIBER_KEY = web.AppKey("pebble_transcriber", object)
+WAITING_REFRESH_TASK_KEY = web.AppKey("waiting_refresh_task", asyncio.Task[None])
 
 
 def _bearer_protected(handler):
@@ -543,6 +591,8 @@ def _register_protected_routes(app: web.Application) -> None:
         "record_workflow_report": record_workflow_report,
         "list_workflow_reports": list_workflow_reports,
         "get_workflow_report": get_workflow_report,
+        "get_waiting_items": get_waiting_items,
+        "send_waiting_feedback": send_waiting_feedback,
     }
     declared = {operation.operation_id for operation in ACCESS_VECTOR}
     registered = set(handlers)
@@ -569,6 +619,9 @@ def create_app(
     *,
     pebble_forwarder: Any | None = None,
     pebble_transcriber: Any | None = None,
+    waiting_source: WaitingSource | None = None,
+    cursor_agents: CursorAgents | None = None,
+    waiting_demo: bool = False,
 ) -> web.Application:
     install_secret_redaction(
         config.homelab_functions_token,
@@ -576,6 +629,8 @@ def create_app(
         config.grok_pebble_webhook_key,
         config.xai_api_key,
         config.ha_long_lived_token,
+        config.dashboard_gh_app_key,
+        config.cursor_api_key,
     )
     prepare_pebble_storage(config.pebble_ledger_path, config.pebble_audio_dir)
     app = web.Application()
@@ -598,10 +653,71 @@ def create_app(
         app[PEBBLE_FORWARDER_KEY] = pebble_forwarder
     if pebble_transcriber is not None:
         app[PEBBLE_TRANSCRIBER_KEY] = pebble_transcriber
+    _install_waiting_dashboard(app, config, waiting_source, cursor_agents, waiting_demo)
     _register_public_routes(app)
     _register_protected_routes(app)
     _register_http_only_routes(app)
+    register_dashboard_routes(app)
     return app
+
+
+def _install_waiting_dashboard(
+    app: web.Application,
+    config: Config,
+    source: WaitingSource | None,
+    agents: CursorAgents | None,
+    demo: bool,
+) -> None:
+    transport = AiohttpJsonTransport(config.request_timeout_seconds)
+    missing = config.dashboard_missing_settings()
+    if source is None and not missing:
+        source = GitHubWaitingSource(
+            app_id=config.dashboard_gh_app_id,
+            installation_id=config.dashboard_gh_app_installation_id,
+            owner=config.dashboard_gh_owner,
+            private_key=config.dashboard_gh_app_key,
+            transport=transport,
+        )
+    if agents is None and config.cursor_api_key:
+        agents = CursorAgentsClient(config.cursor_api_key, transport)
+    store = FeedbackStore(config.waiting_feedback_path)
+    board = WaitingBoard(
+        source,
+        store,
+        refresh_seconds=config.dashboard_refresh_seconds,
+        unconfigured_message=f"GitHub is not configured. Set {', '.join(missing)} on homelab-functions.",
+        feedback_enabled=agents is not None,
+        demo=demo,
+    )
+    app[BOARD_KEY] = board
+    app[FEEDBACK_KEY] = FeedbackService(store, board, agents)
+    app[SETTINGS_KEY] = DashboardSettings(config.homelab_functions_token, config.dashboard_public_url)
+    if source is not None:
+        app.on_startup.append(start_waiting_refresh)
+        app.on_cleanup.append(stop_waiting_refresh)
+    app.on_shutdown.append(close_waiting_streams)
+
+
+async def start_waiting_refresh(app: web.Application) -> None:
+    app[WAITING_REFRESH_TASK_KEY] = asyncio.create_task(
+        run_refresh_loop(app[BOARD_KEY]),
+        name="homelab-waiting-refresh",
+    )
+
+
+async def stop_waiting_refresh(app: web.Application) -> None:
+    task = app.get(WAITING_REFRESH_TASK_KEY)
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def close_waiting_streams(app: web.Application) -> None:
+    app[BOARD_KEY].close()
 
 
 def _register_http_only_routes(app: web.Application) -> None:
@@ -708,8 +824,23 @@ async def health(request: web.Request) -> web.Response:
             "notification_action_recorder_last_error": (
                 recorder.last_error if recorder is not None else ""
             ),
+            "waiting_github_status": request.app[BOARD_KEY].status,
+            "waiting_feedback_enabled": request.app[FEEDBACK_KEY].enabled,
+            "waiting_demo": request.app[BOARD_KEY].demo,
         }
     )
+
+
+async def get_waiting_items(request: web.Request) -> web.Response:
+    return web.json_response(request.app[BOARD_KEY].payload())
+
+
+async def send_waiting_feedback(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error_response(HTTPStatus.BAD_REQUEST, "invalid_request", "Request body must be JSON")
+    return await submit_feedback(request.app[FEEDBACK_KEY], payload)
 
 
 async def notify_joe(request: web.Request) -> web.Response:

@@ -402,6 +402,45 @@ ACCESS_VECTOR = AccessVector(
                 AccessError("404", "Report not found"),
             ),
         ),
+        AccessOperation(
+            operation_id="get_waiting_items",
+            method="GET",
+            path="/v1/waiting",
+            summary="Return Joe's Waiting on me inbox",
+            description=(
+                "Return only the items that need Joe, in seven categories, each with what is needed, why, "
+                "one primary action, and a source link. This is the same snapshot document the inbox page "
+                "and its SSE stream publish."
+            ),
+            domain="Waiting on me",
+            parameters=(),
+            errors=_documented_errors(),
+        ),
+        AccessOperation(
+            operation_id="send_waiting_feedback",
+            method="POST",
+            path="/v1/waiting/feedback",
+            summary="Send feedback on an inbox item to its Cursor agent",
+            description=(
+                "Send feedback on one inbox item. The first feedback launches one Cursor agent that "
+                "opens one pull request; later feedback goes to that same agent. Reuse request_id to "
+                "retry safely. Feedback never approves, merges, or deploys anything."
+            ),
+            domain="Waiting on me",
+            parameters=(
+                _param("item_id", "body", _STRING, required=True),
+                _param("feedback", "body", _STRING, required=True),
+                _param("request_id", "body", _STRING),
+            ),
+            errors=_documented_errors(
+                AccessError("400", "Invalid request"),
+                AccessError("404", "No inbox item has that id"),
+                AccessError("409", "request_id reused for other feedback, or the agent is busy"),
+                AccessError("502", "Cursor rejected the request"),
+                AccessError("503", "Feedback is off because CURSOR_API_KEY is not set"),
+                AccessError("504", "Cursor did not confirm the request"),
+            ),
+        ),
     )
 )
 
@@ -577,3 +616,56 @@ def _assert_http_only_disjoint() -> None:
 
 
 _assert_http_only_disjoint()
+
+
+@dataclass(frozen=True)
+class DashboardRoute:
+    """A browser route of the Waiting on me inbox.
+
+    These routes use a signed session cookie, never a bearer token, and stay
+    outside `/v1` and `ACCESS_VECTOR`. Agents read and send the same data with
+    `get_waiting_items` and `send_waiting_feedback`.
+    """
+
+    method: str
+    path: str
+    summary: str
+    auth: str
+
+    def __post_init__(self) -> None:
+        if self.path.startswith("/v1"):
+            raise ValueError(f"Dashboard route {self.path} must stay outside /v1")
+        if self.auth not in {"none", "session", "sign-in form"}:
+            raise ValueError(f"Unknown dashboard auth for {self.path}: {self.auth}")
+
+
+DASHBOARD_ROUTES: tuple[DashboardRoute, ...] = (
+    DashboardRoute("GET", "/", "Redirect the inbox hostname to /waiting.", "none"),
+    DashboardRoute("GET", "/waiting", "Inbox page. Shows the sign-in form without a session.", "session"),
+    DashboardRoute(
+        "POST",
+        "/waiting/session",
+        "Sign in with HOMELAB_FUNCTIONS_TOKEN and receive a 30-day session cookie.",
+        "sign-in form",
+    ),
+    DashboardRoute("POST", "/waiting/sign-out", "Clear the session cookie.", "session"),
+    DashboardRoute("GET", "/waiting/events", "Server-sent events: the snapshot now and after every change.", "session"),
+    DashboardRoute("GET", "/waiting/snapshot", "The same snapshot as JSON, for the polling fallback.", "session"),
+    DashboardRoute("POST", "/waiting/feedback", "Send feedback on one item. Same body as send_waiting_feedback.", "session"),
+    DashboardRoute("POST", "/waiting/handled", "Joe marks one item done. Not for approve/merge items.", "session"),
+)
+
+
+def _assert_dashboard_disjoint() -> None:
+    taken = {(op.method, op.path) for op in ACCESS_VECTOR}
+    taken |= {(op.method, op.path) for op in HTTP_ONLY_OPERATIONS}
+    taken |= {(endpoint.method, endpoint.path) for endpoint in PUBLIC_ENDPOINTS}
+    seen: set[tuple[str, str]] = set()
+    for route in DASHBOARD_ROUTES:
+        key = (route.method, route.path)
+        if key in taken or key in seen:
+            raise ValueError(f"Dashboard route collides with another route: {route.method} {route.path}")
+        seen.add(key)
+
+
+_assert_dashboard_disjoint()

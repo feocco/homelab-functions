@@ -21,10 +21,19 @@ from urllib.parse import parse_qs, urlsplit
 from aiohttp.test_utils import TestClient, TestServer
 
 import homelab
-from homelab.access import ACCESS_VECTOR, HTTP_ONLY_OPERATIONS, PEBBLE_PHONE_URL, PEBBLE_TAILNET_HTTP_URL
+from homelab.access import (
+    ACCESS_VECTOR,
+    DASHBOARD_ROUTES,
+    HTTP_ONLY_OPERATIONS,
+    PEBBLE_PHONE_URL,
+    PEBBLE_TAILNET_HTTP_URL,
+)
 from homelab.client import HomelabFunctionsClient, HomelabFunctionsError
 from homelab.consumers import CONSUMERS, consumer_matrix_markdown
 from homelab.server import Config, HomeAssistantError, create_app
+from homelab.waiting_cli import verify as verify_dashboard
+from homelab.waiting import Category
+from waiting_support import FakeCursor, StaticSource, make_item
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -208,6 +217,57 @@ CONTRACTS = (
         ),
         "errors": REPORT_ERRORS,
     },
+    {
+        "operation_id": "get_waiting_items",
+        "method": "GET",
+        "path": "/v1/waiting",
+        "summary": "Return Joe's Waiting on me inbox",
+        "description": (
+            "Return only the items that need Joe, in seven categories, each with what is needed, why, "
+            "one primary action, and a source link. This is the same snapshot document the inbox page "
+            "and its SSE stream publish."
+        ),
+        "domain": "Waiting on me",
+        "parameters": (),
+        "errors": (UNAUTHORIZED,),
+    },
+    {
+        "operation_id": "send_waiting_feedback",
+        "method": "POST",
+        "path": "/v1/waiting/feedback",
+        "summary": "Send feedback on an inbox item to its Cursor agent",
+        "description": (
+            "Send feedback on one inbox item. The first feedback launches one Cursor agent that "
+            "opens one pull request; later feedback goes to that same agent. Reuse request_id to "
+            "retry safely. Feedback never approves, merges, or deploys anything."
+        ),
+        "domain": "Waiting on me",
+        "parameters": (
+            {"name": "item_id", "location": "body", "required": True, "schema": STRING},
+            {"name": "feedback", "location": "body", "required": True, "schema": STRING},
+            {"name": "request_id", "location": "body", "required": False, "schema": STRING},
+        ),
+        "errors": (
+            INVALID_REQUEST,
+            UNAUTHORIZED,
+            {"status": "404", "description": "No inbox item has that id"},
+            {"status": "409", "description": "request_id reused for other feedback, or the agent is busy"},
+            {"status": "502", "description": "Cursor rejected the request"},
+            {"status": "503", "description": "Feedback is off because CURSOR_API_KEY is not set"},
+            {"status": "504", "description": "Cursor did not confirm the request"},
+        ),
+    },
+)
+
+EXPECTED_DASHBOARD_ROUTES = (
+    ("GET", "/", "none"),
+    ("GET", "/waiting", "session"),
+    ("POST", "/waiting/session", "sign-in form"),
+    ("POST", "/waiting/sign-out", "session"),
+    ("GET", "/waiting/events", "session"),
+    ("GET", "/waiting/snapshot", "session"),
+    ("POST", "/waiting/feedback", "session"),
+    ("POST", "/waiting/handled", "session"),
 )
 
 EXPECTED_IDS = (
@@ -220,6 +280,8 @@ EXPECTED_IDS = (
     "record_workflow_report",
     "list_workflow_reports",
     "get_workflow_report",
+    "get_waiting_items",
+    "send_waiting_feedback",
 )
 EXPECTED_ROUTES = (
     ("POST", "/v1/notify/joe"),
@@ -231,6 +293,8 @@ EXPECTED_ROUTES = (
     ("POST", "/v1/workflow-reports"),
     ("GET", "/v1/workflow-reports"),
     ("GET", "/v1/workflow-reports/{report_id}"),
+    ("GET", "/v1/waiting"),
+    ("POST", "/v1/waiting/feedback"),
     ("POST", "/v1/pebble"),
 )
 
@@ -243,6 +307,7 @@ PUBLIC_EXPORTS = [
     "NotificationActionRouter",
     "get_service_catalog",
     "get_smoke_signal_targets",
+    "get_waiting_items",
     "get_workflow_report",
     "list_notifications",
     "list_workflow_reports",
@@ -250,6 +315,7 @@ PUBLIC_EXPORTS = [
     "notify_joe",
     "record_notification_action",
     "record_workflow_report",
+    "send_waiting_feedback",
     "workflow_report_button",
     "websocket_url",
 ]
@@ -346,6 +412,9 @@ def write_runtime(tmp: Path) -> Config:
         homelab_smoke_signal_targets_path=str(smoke_path),
         notification_ledger_path=str(tmp / "notifications.sqlite3"),
         notification_action_recorder_enabled=False,
+        waiting_feedback_path=str(tmp / "waiting-feedback.sqlite3"),
+        dashboard_public_url="http://127.0.0.1",
+        dashboard_refresh_seconds=3600,
     )
 
 
@@ -427,6 +496,29 @@ class ContractTests(unittest.TestCase):
         for path in PUBLIC_PATHS:
             self.assertIn(("GET", path), available)
             self.assertNotIn(("POST", path), available)
+
+    def test_every_route_belongs_to_exactly_one_access_class(self):
+        self.assertEqual(
+            tuple((route.method, route.path, route.auth) for route in DASHBOARD_ROUTES),
+            EXPECTED_DASHBOARD_ROUTES,
+        )
+        classes = {
+            "public": {("GET", path) for path in PUBLIC_PATHS},
+            "registry": {(operation.method, operation.path) for operation in ACCESS_VECTOR},
+            "http_only": {(operation.method, operation.path) for operation in HTTP_ONLY_OPERATIONS},
+            "dashboard": {(method, path) for method, path, _auth in EXPECTED_DASHBOARD_ROUTES},
+        }
+        with TemporaryDirectory() as tmp:
+            app = create_app(write_runtime(Path(tmp)), ha_client=FakeHomeAssistant())
+            served = {
+                (route.method, route.resource.canonical)
+                for route in app.router.routes()
+                if route.method != "HEAD"
+            }
+        owners = {route: [name for name, routes in classes.items() if route in routes] for route in served}
+        self.assertEqual({route: names for route, names in owners.items() if len(names) != 1}, {})
+        self.assertEqual(served, set().union(*classes.values()))
+        self.assertFalse(any(path.startswith("/v1") for _method, path in classes["dashboard"]))
 
     def test_client_surface(self):
         signature = inspect.signature(HomelabFunctionsClient.__init__)
@@ -825,6 +917,32 @@ class ClientHelperTests(unittest.TestCase):
                 {},
                 None,
             ),
+            (
+                lambda: homelab.get_waiting_items(service_url=base, token=token),
+                {"marker": "get_waiting_items"},
+                "GET",
+                "/v1/waiting",
+                {},
+                None,
+            ),
+            (
+                lambda: homelab.send_waiting_feedback(
+                    "feocco/homelab-config#41:secret:3f9a1c2b7d",
+                    "Rename the flag.",
+                    request_id="helper-request-1",
+                    service_url=base,
+                    token=token,
+                ),
+                {"marker": "send_waiting_feedback"},
+                "POST",
+                "/v1/waiting/feedback",
+                {},
+                {
+                    "item_id": "feocco/homelab-config#41:secret:3f9a1c2b7d",
+                    "feedback": "Rename the flag.",
+                    "request_id": "helper-request-1",
+                },
+            ),
         ]
         seen = set()
         for invoke, payload, method, path, query, body in specs:
@@ -1039,7 +1157,7 @@ class OpenAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog.status, 401)
 
     async def test_every_registry_route_rejects_missing_bearer(self):
-        self.assertEqual(len(ACCESS_VECTOR), 9)
+        self.assertEqual(len(ACCESS_VECTOR), 11)
         for operation in ACCESS_VECTOR:
             path = operation.path
             for parameter in operation.parameters:
@@ -1135,8 +1253,19 @@ class EndToEndTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = TemporaryDirectory()
         self.fake = FakeHomeAssistant()
+        self.cursor = FakeCursor()
         self.background = BackgroundApp(
-            create_app(write_runtime(Path(self.tmpdir.name)), ha_client=self.fake)
+            create_app(
+                write_runtime(Path(self.tmpdir.name)),
+                ha_client=self.fake,
+                waiting_source=StaticSource(
+                    [
+                        make_item(14, category=Category.SECRET),
+                        make_item(15, repo="feocco/homelab-config", category=Category.APPROVE_MERGE, need="Approve and merge “Fake”"),
+                    ]
+                ),
+                cursor_agents=self.cursor,
+            )
         )
         self.url = self.background.start()
         self.api = HomelabFunctionsClient(self.url, TOKEN, timeout=5)
@@ -1571,6 +1700,53 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn(TOKEN, json.dumps(missing_body))
         self.assertNotIn(TOKEN, self.read_stderr())
 
+    def test_waiting_actions_agree_across_client_mcp_and_dashboard(self):
+        snapshot = self.api.get_waiting_items()
+        for _ in range(50):
+            if snapshot["github"]["status"] == "ok":
+                break
+            threading.Event().wait(0.05)
+            snapshot = self.api.get_waiting_items()
+        mcp_error, mcp_snapshot = self.call_tool("get_waiting_items")
+        self.assertFalse(mcp_error)
+        self.assertEqual(mcp_snapshot, snapshot)
+        item_id = make_item(14, category=Category.SECRET).id
+        self.assertEqual(
+            [item["id"] for item in snapshot["items"]],
+            ["feocco/homelab-config#15:approve_merge", item_id],
+        )
+
+        launched = self.api.send_waiting_feedback(item_id, "Client note.", request_id="parity-client-1")
+        self.assertEqual(launched["delivery"], "launch")
+        follow_error, followed = self.call_tool(
+            "send_waiting_feedback",
+            {"item_id": item_id, "feedback": "MCP note.", "request_id": "parity-mcp-0001"},
+        )
+        self.assertFalse(follow_error)
+        self.assertEqual(followed["delivery"], "followup")
+        self.assertEqual(followed["agent"]["id"], launched["agent"]["id"])
+        replay_error, replay = self.call_tool(
+            "send_waiting_feedback",
+            {"item_id": item_id, "feedback": "Client note.", "request_id": "parity-client-1"},
+        )
+        self.assertFalse(replay_error)
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual((len(self.cursor.launches), len(self.cursor.follow_ups)), (1, 1))
+
+        unknown_error, unknown = self.call_tool(
+            "send_waiting_feedback",
+            {"item_id": "feocco/not-waiting#1:secret:0123456789", "feedback": "Hi."},
+        )
+        self.assertTrue(unknown_error)
+        self.assertEqual((unknown["status"], unknown["code"]), (404, "unknown_item"))
+        with self.assertRaises(HomelabFunctionsError) as invalid:
+            self.api.send_waiting_feedback("not an item", "Hi.")
+        self.assertEqual((invalid.exception.status, invalid.exception.detail), (400, "item_id"))
+
+        report = verify_dashboard(self.url, TOKEN)
+        self.assertTrue(report["ok"], json.dumps(report, indent=2))
+        self.assertEqual([item["id"] for item in self.api.get_waiting_items()["items"]], [item["id"] for item in snapshot["items"]])
+
 
 EXPECTED_CALLERS = (
     {
@@ -1899,6 +2075,16 @@ class ServiceDocsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row.cell("Auth").text(), "None")
         for card in self.cards.values():
             self.assertNotIn(card.attrs["data-path"], PUBLIC_PATHS)
+
+    def test_dashboard_section_lists_every_browser_route(self):
+        section = self.tree.find_all("section", id="dashboard")[0]
+        rows = [row.attrs["data-dashboard-route"] for row in section.having("data-dashboard-route")]
+        self.assertEqual(rows, [f"{method} {path}" for method, path, _auth in EXPECTED_DASHBOARD_ROUTES])
+        for row, (_method, _path, auth) in zip(section.having("data-dashboard-route"), EXPECTED_DASHBOARD_ROUTES, strict=True):
+            self.assertEqual(row.cell("Auth").text(), auth)
+        text = section.text()
+        self.assertIn("bearer token does not open them", text)
+        self.assertIn("#op-get_waiting_items", [link.attrs["href"] for link in section.find_all("a")])
 
     def test_boundaries_keep_home_assistant_work_client_side(self):
         boundaries = self.tree.find_all("section", id="boundaries")[0].text()
