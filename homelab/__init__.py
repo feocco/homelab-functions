@@ -19,6 +19,7 @@ _EXPORTS = {
     "NotificationActionRouter": ("homelab.notification_actions", "NotificationActionRouter"),
     "get_service_catalog": ("homelab.client", "get_service_catalog"),
     "get_smoke_signal_targets": ("homelab.client", "get_smoke_signal_targets"),
+    "get_waiting_items": ("homelab.client", "get_waiting_items"),
     "get_workflow_report": ("homelab.client", "get_workflow_report"),
     "list_notifications": ("homelab.client", "list_notifications"),
     "list_workflow_reports": ("homelab.client", "list_workflow_reports"),
@@ -26,6 +27,7 @@ _EXPORTS = {
     "notify_joe": ("homelab.client", "notify_joe"),
     "record_notification_action": ("homelab.client", "record_notification_action"),
     "record_workflow_report": ("homelab.client", "record_workflow_report"),
+    "send_waiting_feedback": ("homelab.client", "send_waiting_feedback"),
     "workflow_report_button": ("homelab.client", "workflow_report_button"),
     "websocket_url": ("homelab.home_assistant", "websocket_url"),
 }

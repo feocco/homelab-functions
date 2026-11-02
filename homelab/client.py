@@ -195,6 +195,29 @@ class HomelabFunctionsClient:
 
         return self.call("get_workflow_report", {"report_id": report_id})
 
+    def get_waiting_items(self) -> dict[str, Any]:
+        """Return the Waiting on me snapshot: open PRs waiting on Joe and their feedback agents."""
+
+        return self.call("get_waiting_items")
+
+    def send_waiting_feedback(
+        self,
+        item_id: str,
+        feedback: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Send feedback on one waiting item to its single Cursor agent.
+
+        Reuse `request_id` to retry without sending twice. Feedback never
+        approves, merges, or deploys anything.
+        """
+
+        return self.call(
+            "send_waiting_feedback",
+            {"item_id": item_id, "feedback": feedback, "request_id": request_id},
+        )
+
     def call(self, operation_id: str, arguments: Mapping[str, Any] | None = None) -> Any:
         """Call one registry operation by id.
 
@@ -482,6 +505,35 @@ def get_workflow_report(
     """Get one workflow report by id."""
 
     return HomelabFunctionsClient(service_url, token, timeout).get_workflow_report(report_id)
+
+
+def get_waiting_items(
+    *,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Return the Waiting on me snapshot: open PRs waiting on Joe and their feedback agents."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).get_waiting_items()
+
+
+def send_waiting_feedback(
+    item_id: str,
+    feedback: str,
+    *,
+    request_id: str | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Send feedback on one waiting item to its single Cursor agent."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).send_waiting_feedback(
+        item_id,
+        feedback,
+        request_id=request_id,
+    )
 
 
 def _parse_error_payload(body: str) -> dict[str, str]:

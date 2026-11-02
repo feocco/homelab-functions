@@ -4,8 +4,9 @@ description: >-
   Use the homelab-functions broker for named actions such as notify_joe,
   notify_jess, list_notifications, record_notification_action,
   get_service_catalog, get_smoke_signal_targets, record_workflow_report,
-  list_workflow_reports, and get_workflow_report. For Home Assistant state,
-  events, and service calls, use homelab.HomeAssistantWebSocketClient.
+  list_workflow_reports, get_workflow_report, get_waiting_items, and
+  send_waiting_feedback. For Home Assistant state, events, and service calls,
+  use homelab.HomeAssistantWebSocketClient.
 ---
 
 # Homelab functions
@@ -53,6 +54,12 @@ Use `list_workflow_reports` to read recent workflow reports. Filter with `workfl
 ## Get one workflow report
 
 Use `get_workflow_report` when you already have a report id and need that one record.
+
+## Waiting on me
+
+Use `get_waiting_items` to read the open pull requests waiting on Joe. It returns the same `waiting-on-me.v1` snapshot that the dashboard at `https://waiting.home.feocco.com` shows. Each item has an id like `feocco/homelab-functions#14`, its GitHub URL, check state, and its feedback agent, if it has one.
+
+Use `send_waiting_feedback` to pass Joe's feedback on one item to Cursor. The first feedback starts one Cursor agent that opens one pull request. Later feedback goes to the same agent. Send a `request_id` and reuse it on retry, so a retry does not send the feedback twice. Feedback never approves, merges, or deploys anything. It returns `503` when `CURSOR_API_KEY` is not set on the server.
 
 ## Pebble ring relay
 

@@ -22,6 +22,10 @@
   `HomelabFunctionsClient` method, an MCP tool, a plugin skill entry, and
   behavior-level coverage in `tests/test_access_vector_parity.py`.
 - `/health`, `/docs`, and `/openapi.json` stay public and outside the registry.
+- The Waiting on me browser routes live in `DASHBOARD_ROUTES`, outside `/v1`,
+ behind a session cookie. `tests/test_access_vector_parity.py` checks that
+ every served route belongs to exactly one of `PUBLIC_ENDPOINTS`,
+ `ACCESS_VECTOR`, `HTTP_ONLY_OPERATIONS`, or `DASHBOARD_ROUTES`.
 - `POST /v1/pebble` is the one HTTP-only exception. It lives in
   `HTTP_ONLY_OPERATIONS`, not `ACCESS_VECTOR`, because the ring posts
   multipart audio and authenticates with `PEBBLE_RING_TOKEN`. Do not give it
@@ -32,6 +36,35 @@
  `docs/architecture.md` must match `consumer_matrix_markdown()` exactly.
 - Do not add generic Home Assistant state, event, or service-call operations
   to the registry. Use `homelab.HomeAssistantWebSocketClient` for that work.
+
+## Waiting on Me Dashboard
+
+- Browser: `https://waiting.home.feocco.com` (`/waiting`). Agents:
+ `get_waiting_items` and `send_waiting_feedback`, which are normal registry
+ actions with a client method, MCP tool, and skill entry.
+- `WaitingBoard.payload()` in `homelab/waiting.py` is the only snapshot
+ builder. The page, SSE stream, polling fallback, and `GET /v1/waiting` all
+ serve it. Do not add a second serializer.
+- Browser routes live in `DASHBOARD_ROUTES`, outside `/v1`. They use the
+ session cookie from `homelab/waiting_web.py`. Never let the cookie open `/v1`
+ or the bearer token open `/waiting/*`.
+- Feedback keeps one Cursor agent per item. Store the agent id before calling
+ Cursor, reuse it on retry, and never add launch fields that approve, merge,
+ or deploy. The GitHub App token must stay read-only.
+- UI copy: plain sentences, no internal jargon. Render untrusted text with
+ `textContent`. Script and style stay inline and hash-pinned by the CSP.
+- Verify a change end to end:
+ `./.venv/bin/python -m homelab.waiting_cli demo --port 8099` in one shell,
+ then `./.venv/bin/python -m homelab.waiting_cli verify --url
+ http://127.0.0.1:8099 --token demo-token-not-a-secret --exercise-feedback`.
+ It prints a JSON report and exits 1 on any failed check. Without
+ `--exercise-feedback` it is read-only and safe to run against production with
+ the real token.
+- Visual changes: with the demo running, `./.venv/bin/python
+ scripts/waiting_browser_check.py --out /tmp/waiting-shots` (needs
+ `playwright` and Chrome) screenshots desktop and mobile in light and dark
+ mode, checks live updates, the polling fallback, and feedback, and prints a
+ JSON report.
 
 ## Public API Documentation
 

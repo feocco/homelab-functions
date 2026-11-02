@@ -38,7 +38,9 @@ independent copy of the contract. It also runs each documented example through
 the real client to prove that the three call shapes send the same request.
 
 `/health`, `/docs`, and `/openapi.json` stay public. They are listed in
-`homelab.access.PUBLIC_ENDPOINTS`, not in the registry.
+`homelab.access.PUBLIC_ENDPOINTS`, not in the registry. The Waiting on me
+browser routes are listed in `homelab.access.DASHBOARD_ROUTES`. The parity
+tests check that every served route belongs to exactly one of these lists.
 
 ## Callers
 
@@ -97,7 +99,8 @@ Workflow reports are human-submitted "please investigate" records.
 5. The server stores the report with status `reported`.
 
 Reports are records only. The server does not start Codex, Cursor, GitHub
-issues, or webhooks. A future investigator service can read reports with
+issues, or webhooks from a report. Only `send_waiting_feedback` starts Cursor
+work. A future investigator service can read reports with
 `list_workflow_reports` or `get_workflow_report` and own repository selection,
 sessions, logs, and pull requests.
 
@@ -121,6 +124,11 @@ cloning `homelab-config`.
   cannot run authenticated calls or leak a pasted token.
 - The broker has no generic state, event, or service-call route. Adding one
   would turn the token into Home Assistant admin access.
+- The dashboard page sends a Content-Security-Policy with hash-pinned script
+  and style and `connect-src 'self'`. It renders pull request titles with
+  `textContent`, and the embedded snapshot escapes `<`, `>`, and `&`.
+- `DASHBOARD_GH_APP_KEY` and `CURSOR_API_KEY` are redacted from logs and never
+  appear in responses or error messages.
 
 ## Pebble ring relay
 
@@ -168,6 +176,78 @@ Leave the route, DNS, and Tailscale Serve config as they are. The container
 already mounts `./data` on `/app/data`, which holds the dedupe ledger and the
 short-lived audio files. `GET /docs` on the existing service is the catalog
 `docs_url` for this API, so the catalog generator does not need a new path.
+
+## Waiting on me
+
+The dashboard at `https://waiting.home.feocco.com` shows the open, non-draft
+pull requests across `DASHBOARD_GH_OWNER` repos. homelab-config routes that
+hostname to this service on port 8091, and `/` redirects to `/waiting` there.
+
+### One snapshot
+
+`homelab.waiting.WaitingBoard` holds the items and builds one
+`waiting-on-me.v1` document each time something changes. The page embeds it,
+`GET /waiting/events` streams it, `GET /waiting/snapshot` returns it for the
+polling fallback, and `get_waiting_items` returns it to agents. None of them
+builds its own copy, so a browser and an agent never disagree about what is
+waiting. `version` increases with each publish. An item's id is
+`owner/repo#number`, which is stable for the life of the pull request.
+
+The board refreshes every `DASHBOARD_REFRESH_SECONDS` (default 60) with one
+GraphQL search for open pull requests and their check rollup. When GitHub
+fails, the board keeps the last good items, sets `github.status` to `error`,
+and the page says how old its data is. Without the `DASHBOARD_GH_*` settings,
+`github.status` is `unconfigured` and the message names the missing variables.
+
+The page listens on server-sent events and shows **Live** while events or
+15-second heartbeats arrive. If the stream does not reconnect within 8
+seconds, or goes 45 seconds without a message, the page polls
+`/waiting/snapshot` every 30 seconds and shows **Polling** until the stream
+returns. Cards new since the last update animate in.
+
+### GitHub access
+
+`homelab.github_waiting` signs a nine-minute RS256 JWT with
+`DASHBOARD_GH_APP_KEY` and exchanges it for an installation token. A token with
+any permission other than `read` is refused before any query, and only
+GraphQL queries are sent. The dashboard cannot change GitHub, even if someone
+later grants the App write access.
+
+### Feedback
+
+Feedback on an item goes to exactly one Cursor Cloud Agent:
+
+1. The first feedback stores a new `bc-…` agent id for the item in SQLite
+   (`WAITING_FEEDBACK_PATH`), then calls `POST /v1/agents` with that id,
+   `autoCreatePR: true`, and `workOnCurrentBranch: false`. The agent starts
+   from the pull request's branch and opens its own pull request.
+2. Later feedback calls `POST /v1/agents/{id}/runs` on the same agent. When the
+   agent is busy, the feedback steers the running turn instead.
+3. The refresh loop records the feedback pull request URL once Cursor reports
+   it, and the card links to it.
+
+| Failure | What happens |
+| --- | --- |
+| Two submits for one item at once | A per-item lock runs them in order. The item's primary key keeps one agent id even across processes. |
+| Launch times out or Cursor returns 5xx | The item stays `launching`. Any retry re-sends the same agent id, and Cursor answers `409 agent_id_conflict` if the first launch landed. |
+| Follow-up times out | The request is stored as `unconfirmed` and is not re-sent. The caller is told to check the agent. |
+| Same `request_id` sent again | The stored result comes back with `duplicate: true`. Cursor is not called. |
+| Agent busy and steering unavailable | `409 agent_busy`. Retrying later is safe. |
+| `CURSOR_API_KEY` unset | The page shows that feedback is off, and the action returns `503`. |
+
+Feedback never approves, merges, or deploys. The launch body is built from a
+fixed field list, the prompt tells the agent not to approve, merge, or deploy,
+and the GitHub token is read-only. Joe reviews and merges the agent's pull
+request himself.
+
+### Browser auth
+
+The browser signs in once with `HOMELAB_FUNCTIONS_TOKEN` and keeps a 30-day
+session cookie: an expiry plus an HMAC keyed by the token. The cookie is
+`HttpOnly`, `SameSite=Strict`, scoped to `/waiting`, and `Secure` when
+`DASHBOARD_PUBLIC_URL` is HTTPS. Rotating the token ends every session. POSTs
+must carry a same-host `Origin`. The cookie opens only `DASHBOARD_ROUTES`, and
+the bearer token does not open them. That keeps `/v1` free of cookie auth.
 
 ## What changes together
 

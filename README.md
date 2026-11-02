@@ -163,6 +163,32 @@ does not forward the audio file, and the route rejects bodies over 9 MiB. See
 [Pebble ring relay](docs/architecture.md#pebble-ring-relay) for the tailnet
 fallback and the homelab-config secret follow-up.
 
+### See what is waiting on Joe
+
+Open <https://waiting.home.feocco.com> and sign in once with
+`HOMELAB_FUNCTIONS_TOKEN`. The page lists open, non-draft pull requests across
+`DASHBOARD_GH_OWNER` repos, grouped as ready, checks failing, checks running,
+and changes requested. Every card links to its GitHub pull request. The page
+updates over server-sent events, falls back to polling every 30 seconds, and
+shows its live state and when GitHub was last read.
+
+**Send feedback** on a card starts one Cursor agent for that pull request. The
+agent opens one pull request for Joe to review. More feedback on the same card
+goes to the same agent. Feedback never approves, merges, or deploys anything.
+
+Agents read the same snapshot and send the same feedback through the broker:
+
+```python
+import homelab
+
+waiting = homelab.get_waiting_items()
+first = waiting["items"][0]
+homelab.send_waiting_feedback(first["id"], "Split the CSS into its own file.", request_id="joe-2026-11-01-a")
+```
+
+See [Waiting on me](docs/architecture.md#waiting-on-me) for auth, identity,
+and failure handling.
+
 ### Use the MCP server or Cursor plugin
 
 `.cursor-plugin/plugin.json` points at `mcp.json` and `skills/`. The plugin
@@ -198,7 +224,8 @@ shows the full API.
 Protected actions are declared in `homelab.access.ACCESS_VECTOR`. The routes,
 OpenAPI document, client methods, MCP tools, and `/docs` page all come from it.
 `POST /v1/pebble` is the HTTP-only exception in `HTTP_ONLY_OPERATIONS`.
-These routes are public:
+The dashboard's browser routes are in `DASHBOARD_ROUTES` and use a session
+cookie instead of the bearer token. These routes are public:
 
 - `GET /health`
 - `GET /docs`
@@ -231,7 +258,21 @@ XAI_STT_MODEL=grok-voice-transcribe-2.0
 PEBBLE_LEDGER_PATH=/app/data/pebble-events.sqlite3
 PEBBLE_AUDIO_DIR=/app/data/pebble-audio
 PEBBLE_AUDIO_TTL_SECONDS=86400
+DASHBOARD_PUBLIC_URL=https://waiting.home.feocco.com
+DASHBOARD_GH_APP_ID=
+DASHBOARD_GH_APP_INSTALLATION_ID=
+DASHBOARD_GH_OWNER=feocco
+DASHBOARD_GH_APP_KEY=
+DASHBOARD_REFRESH_SECONDS=60
+CURSOR_API_KEY=
+WAITING_FEEDBACK_PATH=/app/data/waiting-feedback.sqlite3
 ```
+
+The dashboard reads GitHub only when all four `DASHBOARD_GH_*` values are set.
+`DASHBOARD_GH_APP_KEY` is the App's RSA private key. A `.env` value is one
+line, so store it base64-encoded (`base64 -w0 key.pem`) or with `\n` escapes.
+Without `CURSOR_API_KEY`, the dashboard still shows pull requests and says that
+feedback is off.
 
 `PEBBLE_RING_TOKEN` and `GROK_PEBBLE_WEBHOOK_KEY` are required before the
 ring route will forward. `GROK_PEBBLE_WEBHOOK_URL` defaults to the Cursor
@@ -263,3 +304,11 @@ HA_REQUEST_TIMEOUT_SECONDS=30
 MCP tools, `/docs` page, caller matrix, or skill drift apart. See
 [What changes together](docs/architecture.md#what-changes-together) before
 adding an action.
+
+Run the dashboard on fake data, then check it end to end:
+
+```bash
+./.venv/bin/python -m homelab.waiting_cli demo --port 8099
+./.venv/bin/python -m homelab.waiting_cli verify --url http://127.0.0.1:8099 \
+  --token demo-token-not-a-secret --exercise-feedback
+```
