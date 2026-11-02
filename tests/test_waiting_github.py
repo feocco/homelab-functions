@@ -311,6 +311,24 @@ class InboxTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after_tick.items, [])
         self.assertEqual(after_delete.items, [])
 
+    async def test_ask_examples_in_fenced_code_blocks_are_ignored(self):
+        body = "\n".join(
+            (
+                "Example:",
+                "```markdown",
+                ask("secret", "Add `FAKE_KEY`.", "the example cannot read GitHub."),
+                "```",
+                "~~~",
+                ask("deploy", "Ship the example.", "the example is not live."),
+                "~~~~",
+                ask("question", "Which disk?", "the real task needs an answer."),
+            )
+        )
+        inbox = await self.fetch([pr_node(9, checks="FAILURE", body=body)])
+
+        self.assertEqual([(item.category, item.need) for item in inbox.items], [(Category.QUESTION, "Which disk?")])
+        self.assertEqual(inbox.rejected, [])
+
     async def test_item_ids_stay_stable_across_edits_elsewhere(self):
         line = ask("secret", "Add `FAKE_KEY`.", "the service cannot start.")
         first = await self.fetch([pr_node(9, checks="FAILURE", body=line)])
