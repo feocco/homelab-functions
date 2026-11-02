@@ -2,12 +2,15 @@
 
 The phone posts multipart audio or JSON. This module turns that into a JSON
 event, keeps the audio file locally until a short TTL, and forwards only the
-JSON. It never logs the ring token, the webhook key, or the xAI key.
+JSON. single-click-hold goes to the personal Grok webhook. double-click-hold
+goes to the work Grok webhook. It never logs the ring token, webhook keys, or
+the xAI key.
 """
 
 from __future__ import annotations
 
 import asyncio
+import enum
 import hashlib
 import hmac
 import json
@@ -86,11 +89,51 @@ class Transcript:
     duration_seconds: float | None
 
 
+class PressCount(enum.IntEnum):
+    SINGLE = 1
+    DOUBLE = 2
+
+
+@dataclass(frozen=True)
+class PressRoute:
+    """Canonical gesture and the env pair that receives it."""
+
+    trigger: str
+    press_count: PressCount
+    destination: str
+    url_env: str
+    key_env: str
+    missing_code: str
+
+
+PRESS_ROUTES: tuple[PressRoute, ...] = (
+    PressRoute(
+        "single-click-hold",
+        PressCount.SINGLE,
+        "personal",
+        "GROK_PEBBLE_WEBHOOK_URL",
+        "GROK_PEBBLE_WEBHOOK_KEY",
+        "webhook_not_configured",
+    ),
+    PressRoute(
+        "double-click-hold",
+        PressCount.DOUBLE,
+        "work",
+        "GROK_PEBBLE_WORK_WEBHOOK_URL",
+        "GROK_PEBBLE_WORK_WEBHOOK_KEY",
+        "work_webhook_not_configured",
+    ),
+)
+_PRESS_ROUTES_BY_TRIGGER = {route.trigger: route for route in PRESS_ROUTES}
+
+
 @dataclass(frozen=True)
 class PebbleSettings:
     ring_token: str
     webhook_url: str
     webhook_key: str
+    work_webhook_url: str
+    work_webhook_key: str
     xai_api_key: str
     xai_stt_model: str
     audio_ttl_seconds: int
@@ -102,11 +145,64 @@ class PebbleSettings:
             ring_token=config.pebble_ring_token,
             webhook_url=config.grok_pebble_webhook_url,
             webhook_key=config.grok_pebble_webhook_key,
+            work_webhook_url=config.grok_pebble_work_webhook_url,
+            work_webhook_key=config.grok_pebble_work_webhook_key,
             xai_api_key=config.xai_api_key,
             xai_stt_model=config.xai_stt_model,
             audio_ttl_seconds=config.pebble_audio_ttl_seconds,
             timeout_seconds=config.request_timeout_seconds,
         )
+
+    def credentials_for(self, route: PressRoute) -> tuple[str, str]:
+        return {
+            "personal": (self.webhook_url, self.webhook_key),
+            "work": (self.work_webhook_url, self.work_webhook_key),
+        }[route.destination]
+
+
+def press_route_for(event_type: str) -> PressRoute:
+    """Map a Pebble trigger to a press count. Unknown gestures raise."""
+
+    route = _PRESS_ROUTES_BY_TRIGGER.get(event_type.strip().casefold())
+    if route is None:
+        LOGGER.warning(
+            "pebble relay rejected code=unknown_press_count event_type=%s",
+            _escaped_log_value(event_type.strip()),
+        )
+        raise PebbleRequestError(
+            HTTPStatus.BAD_REQUEST,
+            "unknown_press_count",
+            "event type is not a single or double press-and-hold",
+            detail="event_type",
+        )
+    return route
+
+
+def require_webhook(settings: PebbleSettings, route: PressRoute) -> tuple[str, str]:
+    """Return the route's URL and key, or raise when either is unset."""
+
+    url, key = settings.credentials_for(route)
+    missing = [env for env, value in ((route.url_env, url), (route.key_env, key)) if not value]
+    if not missing:
+        return url, key
+    LOGGER.error(
+        "pebble relay destination unavailable code=%s press_count=%s destination=%s missing=%s",
+        route.missing_code,
+        int(route.press_count),
+        route.destination,
+        ",".join(missing),
+    )
+    raise PebbleRequestError(
+        HTTPStatus.SERVICE_UNAVAILABLE,
+        route.missing_code,
+        _missing_env_message(missing),
+    )
+
+
+def _missing_env_message(names: list[str]) -> str:
+    if len(names) == 1:
+        return f"{names[0]} is not configured"
+    return f"{' and '.join(names)} are not configured"
 
 
 class SecretRedactingFilter(logging.Filter):
@@ -535,17 +631,12 @@ async def relay_event(
             "unauthorized",
             "Invalid or missing pebble bearer token",
         )
-    if not settings.webhook_key:
-        raise PebbleRequestError(
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            "webhook_not_configured",
-            "GROK_PEBBLE_WEBHOOK_KEY is not configured",
-        )
 
     ledger.cleanup_expired(datetime.now(timezone.utc))
     fields, audio, filename, content_type = await read_pebble_request(request)
     now = datetime.now(timezone.utc)
     event = _normalize(fields, audio, request.headers, now=now)
+    route = press_route_for(event["event_type"])
     needs_transcript = event["transcript"] is None
     if needs_transcript and audio is None:
         raise PebbleRequestError(
@@ -573,6 +664,7 @@ async def relay_event(
             detail="event_id",
         )
     try:
+        webhook_url, webhook_key = require_webhook(settings, route)
         if audio is not None:
             ledger.store_audio(
                 event["event_id"],
@@ -591,12 +683,17 @@ async def relay_event(
             transcript_text = transcribed.text
             duration = transcribed.duration_seconds
         payload = _forward_payload(event, transcript_text or "", duration, fields)
-        await forwarder.post_json(settings.webhook_url, settings.webhook_key, payload)
+        await forwarder.post_json(webhook_url, webhook_key, payload)
     except Exception:
         ledger.release(event["event_id"])
         raise
     ledger.mark_forwarded(event["event_id"])
-    LOGGER.info("pebble relay forwarded event_id=%s", _escaped_log_value(event["event_id"]))
+    LOGGER.info(
+        "pebble relay forwarded event_id=%s press_count=%s destination=%s",
+        _escaped_log_value(event["event_id"]),
+        int(route.press_count),
+        route.destination,
+    )
     return {"status": "forwarded", "event_id": event["event_id"], "duplicate": False}
 
 

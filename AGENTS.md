@@ -27,6 +27,12 @@
   multipart audio and authenticates with `PEBBLE_RING_TOKEN`. Do not give it
   a `HomelabFunctionsClient` method or an MCP tool. OpenAPI, `GET /docs`, and
   `tests/test_access_vector_parity.py` still have to name it.
+- Press count stays inside that relay. `single-click-hold` keeps
+  `GROK_PEBBLE_WEBHOOK_URL` and `GROK_PEBBLE_WEBHOOK_KEY`. `double-click-hold`
+  uses `GROK_PEBBLE_WORK_WEBHOOK_URL` and `GROK_PEBBLE_WORK_WEBHOOK_KEY`, which
+  have no default. Any other gesture is rejected. Missing work configuration
+  returns 503 `work_webhook_not_configured` and must not forward to the
+  personal webhook. Do not add a second route for this split.
 - Callers and their ledger conventions live in `CONSUMERS` in
  `homelab/consumers.py`. `GET /docs` renders them, and the caller matrix in
  `docs/architecture.md` must match `consumer_matrix_markdown()` exactly.

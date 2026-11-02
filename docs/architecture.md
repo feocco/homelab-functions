@@ -124,10 +124,19 @@ cloning `homelab-config`.
 
 ## Pebble ring relay
 
-`POST /v1/pebble` accepts the Pebble Index webhook and forwards JSON to the
-configured Grok webhook. The ring posts `multipart/form-data` in every Hold
-and Talk mode. When a recording has no transcription, the server transcribes
-it with xAI and still forwards only JSON. The audio file stays on disk until
+`POST /v1/pebble` accepts the Pebble Index webhook and forwards JSON to one
+Grok webhook chosen by press count. Both hold gestures post to this route.
+`single-click-hold` goes to the personal webhook,
+`GROK_PEBBLE_WEBHOOK_URL` and `GROK_PEBBLE_WEBHOOK_KEY`. That pair is the
+existing `pebble-ring-intake` destination. `double-click-hold` goes to the
+work webhook, `GROK_PEBBLE_WORK_WEBHOOK_URL` and
+`GROK_PEBBLE_WORK_WEBHOOK_KEY`. Those work variables have no default. If
+either is unset, the route returns 503 `work_webhook_not_configured`, logs
+that code, and does not call the personal webhook. Any other trigger,
+including `test-event`, is 400 `unknown_press_count` and is not forwarded.
+The ring posts `multipart/form-data` for each hold gesture. When a recording
+has no transcription, the server transcribes it with xAI and still forwards
+only JSON. The audio file stays on disk until
 `PEBBLE_AUDIO_TTL_SECONDS` (default 24 hours). The event id is stored in
 SQLite and still dedupes after the audio file is gone, including across a
 restart. Only allowlisted Pebble fields leave the host, timestamps must be
@@ -161,10 +170,15 @@ name, the phone can use `http://100.81.237.11:8091/v1/pebble` or
 `http://maclabs-mac-mini.taildf3445.ts.net:8091/v1/pebble` while it is on the
 tailnet.
 
-homelab-config follow-up, not part of deploying this image: add
-`PEBBLE_RING_TOKEN` and `GROK_PEBBLE_WEBHOOK_KEY` to the service secret list,
-and set `XAI_API_KEY` when the ring will send audio without a transcription.
-Leave the route, DNS, and Tailscale Serve config as they are. The container
+homelab-config follow-up, not part of deploying this image: declare
+`GROK_PEBBLE_WORK_WEBHOOK_URL` and `GROK_PEBBLE_WORK_WEBHOOK_KEY` on
+`homelab-functions` `optional_env` in `service-secrets.yaml`. Do not add them
+to the required `env` list. `render-service-env` does not read `optional_env`,
+so also render `HOMELAB_FUNCTIONS__GROK_PEBBLE_WORK_WEBHOOK_URL` and
+`HOMELAB_FUNCTIONS__GROK_PEBBLE_WORK_WEBHOOK_KEY` into container
+`GROK_PEBBLE_WORK_WEBHOOK_URL` and `GROK_PEBBLE_WORK_WEBHOOK_KEY` when those
+GitHub secrets are set, and skip them when they are unset. Leave the route,
+DNS, and Tailscale Serve config as they are. The container
 already mounts `./data` on `/app/data`, which holds the dedupe ledger and the
 short-lived audio files. `GET /docs` on the existing service is the catalog
 `docs_url` for this API, so the catalog generator does not need a new path.
@@ -188,4 +202,5 @@ with no extra code.
 
 `POST /v1/pebble` does not follow that list. A change to it updates
 `HTTP_ONLY_OPERATIONS`, the handler, OpenAPI, `GET /docs`, and the parity
-test that proves the client and MCP still omit it.
+test that proves the client and MCP still omit it. Press-count routing stays
+on this route. It does not add a client method, an MCP tool, or a second path.

@@ -29,6 +29,8 @@ from homelab.server import Config, create_app
 
 RING = "pebble-ring-token-do-not-log"
 WEBHOOK_KEY = "grok-pebble-webhook-key-do-not-log"
+WORK_WEBHOOK_URL = "https://work.example/grok-pebble-webhook"
+WORK_WEBHOOK_KEY = "grok-pebble-work-webhook-key-do-not-log"
 XAI_KEY = "xai-test-key-do-not-log"
 BROKER = "broker-token-do-not-share"
 AUDIO = b"AUDIO-SENTINEL-9f3c-not-audio"
@@ -102,6 +104,8 @@ def make_config(tmp: Path, **overrides) -> Config:
         homelab_smoke_signal_targets_path=str(tmp / "targets.json"),
         pebble_ring_token=RING,
         grok_pebble_webhook_key=WEBHOOK_KEY,
+        grok_pebble_work_webhook_url=WORK_WEBHOOK_URL,
+        grok_pebble_work_webhook_key=WORK_WEBHOOK_KEY,
         xai_api_key=XAI_KEY,
         pebble_ledger_path=str(tmp / "pebble.sqlite3"),
         pebble_audio_dir=str(tmp / "audio"),
@@ -144,8 +148,26 @@ class ConfigDefaultTests(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             config = Config.from_env()
         self.assertEqual(config.grok_pebble_webhook_url, DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
+        self.assertEqual(config.grok_pebble_work_webhook_url, "")
+        self.assertEqual(config.grok_pebble_work_webhook_key, "")
         self.assertEqual(config.pebble_audio_ttl_seconds, 86400)
         self.assertEqual(config.pebble_ring_token, "")
+
+    def test_blank_work_webhook_env_stays_unset(self):
+        env = {
+            "HA_URL": "https://ha.example",
+            "HA_LONG_LIVED_TOKEN": "ha-long-lived-token",
+            "HA_NOTIFY_JOE_SERVICE": "notify.joe",
+            "HA_NOTIFY_JESS_SERVICE": "notify.jess",
+            "HOMELAB_FUNCTIONS_TOKEN": BROKER,
+            "GROK_PEBBLE_WORK_WEBHOOK_URL": "  ",
+            "GROK_PEBBLE_WORK_WEBHOOK_KEY": "   ",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = Config.from_env()
+        self.assertEqual(config.grok_pebble_work_webhook_url, "")
+        self.assertEqual(config.grok_pebble_work_webhook_key, "")
+        self.assertEqual(config.grok_pebble_webhook_url, DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
 
 
 class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
@@ -200,8 +222,8 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         body = await response.json()
         self.assertEqual(body, {"status": "forwarded", "event_id": "json-1", "duplicate": False})
         payload = self.forwarder.calls[0]["payload"]
-        self.assertEqual(self.forwarder.calls[0]["key"], WEBHOOK_KEY)
-        self.assertEqual(self.forwarder.calls[0]["url"], DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
+        self.assertEqual(self.forwarder.calls[0]["key"], WORK_WEBHOOK_KEY)
+        self.assertEqual(self.forwarder.calls[0]["url"], WORK_WEBHOOK_URL)
         self.assertEqual(payload["event_id"], "json-1")
         self.assertEqual(payload["event_type"], "double-click-hold")
         self.assertEqual(payload["timestamp"], timestamp_from_recorded_at(RECORDED_AT))
@@ -621,7 +643,7 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         try:
             response = await no_hook.post(
                 "/v1/pebble",
-                json=self.json_body(),
+                json=self.json_body(event_type="single-click-hold"),
                 headers={"Authorization": f"Bearer {RING}"},
             )
             self.assertEqual(response.status, 503)
@@ -657,7 +679,7 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)
         try:
-            logger.info("probe %s %s %s %s", RING, WEBHOOK_KEY, XAI_KEY, BROKER)
+            logger.info("probe %s %s %s %s %s", RING, WEBHOOK_KEY, WORK_WEBHOOK_KEY, XAI_KEY, BROKER)
             logger.info("Authorization: Bearer %s", RING)
             response = await self.post_multipart(
                 transcription="secret-free transcript",
@@ -671,7 +693,7 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
             logger.removeHandler(handler)
             logger.setLevel(previous)
         text = stream.getvalue()
-        for secret in (RING, WEBHOOK_KEY, XAI_KEY, BROKER):
+        for secret in (RING, WEBHOOK_KEY, WORK_WEBHOOK_KEY, XAI_KEY, BROKER):
             self.assertNotIn(secret, text)
         self.assertIn("[redacted]", text)
         self.assertNotIn(AUDIO.decode(), text)
@@ -770,6 +792,253 @@ class PebbleRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"grok-voice-transcribe-2.0", body)
         self.assertIn(AUDIO, body)
         self.assertNotIn(XAI_KEY.encode(), body)
+
+    async def test_single_press_and_hold_forwards_to_the_personal_webhook(self):
+        response = await self.post_json(
+            self.json_body(event_id="single-1", event_type="Single-Click-Hold")
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            await response.json(),
+            {"status": "forwarded", "event_id": "single-1", "duplicate": False},
+        )
+        call = self.forwarder.calls[0]
+        self.assertEqual(call["url"], DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
+        self.assertEqual(call["key"], WEBHOOK_KEY)
+        self.assertNotEqual(call["url"], WORK_WEBHOOK_URL)
+        payload = call["payload"]
+        self.assertEqual(payload["event_type"], "Single-Click-Hold")
+        self.assertEqual(payload["transcript"], "Hello from json")
+        self.assertNotIn(RING, json.dumps(payload))
+        self.assertNotIn(WEBHOOK_KEY, json.dumps(payload))
+        self.assertNotIn(WORK_WEBHOOK_KEY, json.dumps(payload))
+        self.assertNotIn(AUDIO.decode(), json.dumps(payload))
+
+    async def test_double_press_and_hold_forwards_only_to_the_work_webhook(self):
+        header = await self.post_multipart(
+            transcription="double from header",
+            recordedAt=RECORDED_AT,
+            client="ring",
+            headers={"X-Index-Trigger": "double-click-hold", "X-Index-Delivery": "double-header"},
+        )
+        self.assertEqual(header.status, 200)
+        body_trigger = await self.post_multipart(
+            trigger="double-click-hold",
+            transcription="double from field",
+            recordedAt=RECORDED_AT,
+            client="ring",
+            headers={"X-Index-Trigger": "single-click-hold", "X-Index-Delivery": "double-field"},
+        )
+        self.assertEqual(body_trigger.status, 200)
+        self.assertEqual(
+            [call["url"] for call in self.forwarder.calls],
+            [WORK_WEBHOOK_URL, WORK_WEBHOOK_URL],
+        )
+        self.assertEqual(
+            [call["key"] for call in self.forwarder.calls],
+            [WORK_WEBHOOK_KEY, WORK_WEBHOOK_KEY],
+        )
+        self.assertEqual(
+            [call["payload"]["event_type"] for call in self.forwarder.calls],
+            ["double-click-hold", "double-click-hold"],
+        )
+        self.assertNotIn(DEFAULT_GROK_PEBBLE_WEBHOOK_URL, [call["url"] for call in self.forwarder.calls])
+        dumped = json.dumps([call["payload"] for call in self.forwarder.calls])
+        self.assertNotIn(RING, dumped)
+        self.assertNotIn(WEBHOOK_KEY, dumped)
+        self.assertNotIn(WORK_WEBHOOK_KEY, dumped)
+
+    async def test_double_press_does_not_require_the_personal_webhook(self):
+        await self.client.close()
+        self.client = TestClient(
+            TestServer(
+                app_for(
+                    self.root,
+                    self.forwarder,
+                    self.transcriber,
+                    grok_pebble_webhook_key="",
+                )
+            )
+        )
+        await self.client.start_server()
+        response = await self.post_json(
+            self.json_body(event_id="work-only", event_type="double-click-hold")
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.forwarder.calls[0]["url"], WORK_WEBHOOK_URL)
+        self.assertEqual(self.forwarder.calls[0]["key"], WORK_WEBHOOK_KEY)
+        self.assertNotEqual(self.forwarder.calls[0]["url"], DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
+
+    async def test_body_trigger_beats_a_conflicting_header(self):
+        response = await self.post_multipart(
+            trigger="single-click-hold",
+            transcription="personal wins",
+            recordedAt=RECORDED_AT,
+            headers={"X-Index-Trigger": "double-click-hold", "X-Index-Delivery": "body-wins"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.forwarder.calls[0]["url"], DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
+        self.assertEqual(self.forwarder.calls[0]["key"], WEBHOOK_KEY)
+        self.assertEqual(self.forwarder.calls[0]["payload"]["event_type"], "single-click-hold")
+
+    async def test_unknown_press_counts_are_rejected_and_not_forwarded(self):
+        cases = (
+            "test-event",
+            "single-click",
+            "double-press-and-hold",
+            "2",
+            "triple-click-hold",
+        )
+        for event_type in cases:
+            with self.subTest(event_type=event_type):
+                response = await self.post_json(
+                    self.json_body(event_id=f"unknown-{event_type}", event_type=event_type)
+                )
+                self.assertEqual(response.status, 400)
+                body = await response.json()
+                self.assertEqual(body["error"]["code"], "unknown_press_count")
+                self.assertNotIn(WEBHOOK_KEY, json.dumps(body))
+                self.assertNotIn(WORK_WEBHOOK_KEY, json.dumps(body))
+                self.assertNotIn(DEFAULT_GROK_PEBBLE_WEBHOOK_URL, json.dumps(body))
+        self.assertEqual(self.forwarder.calls, [])
+        retry = await self.post_json(self.json_body(event_id="unknown-test-event", event_type="test-event"))
+        self.assertEqual(retry.status, 400)
+        self.assertEqual((await retry.json())["error"]["code"], "unknown_press_count")
+        recovered = await self.post_json(
+            self.json_body(event_id="unknown-test-event", event_type="single-click-hold")
+        )
+        self.assertEqual(recovered.status, 200)
+        self.assertEqual(self.forwarder.calls[0]["url"], DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
+
+    async def test_missing_work_webhook_fails_closed_without_personal_fallback(self):
+        await self.client.close()
+        cases = (
+            {"grok_pebble_work_webhook_url": "", "grok_pebble_work_webhook_key": ""},
+            {"grok_pebble_work_webhook_url": "", "grok_pebble_work_webhook_key": WORK_WEBHOOK_KEY},
+            {"grok_pebble_work_webhook_url": WORK_WEBHOOK_URL, "grok_pebble_work_webhook_key": ""},
+        )
+        expected_names = (
+            ("GROK_PEBBLE_WORK_WEBHOOK_URL", "GROK_PEBBLE_WORK_WEBHOOK_KEY"),
+            ("GROK_PEBBLE_WORK_WEBHOOK_URL",),
+            ("GROK_PEBBLE_WORK_WEBHOOK_KEY",),
+        )
+        for index, (overrides, names) in enumerate(zip(cases, expected_names, strict=True)):
+            with self.subTest(missing=names):
+                self.forwarder.calls.clear()
+                stream = io.StringIO()
+                handler = logging.StreamHandler(stream)
+                logger = logging.getLogger("homelab-functions")
+                logger.addHandler(handler)
+                client = TestClient(
+                    TestServer(app_for(self.root, self.forwarder, self.transcriber, **overrides))
+                )
+                await client.start_server()
+                try:
+                    payload = self.json_body(
+                        event_id=f"work-missing-{index}",
+                        event_type="double-click-hold",
+                    )
+                    first = await client.post(
+                        "/v1/pebble",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {RING}"},
+                    )
+                    second = await client.post(
+                        "/v1/pebble",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {RING}"},
+                    )
+                    single = await client.post(
+                        "/v1/pebble",
+                        json=self.json_body(
+                            event_id=f"still-personal-{index}",
+                            event_type="single-click-hold",
+                        ),
+                        headers={"Authorization": f"Bearer {RING}"},
+                    )
+                    outcomes = (
+                        (first.status, await first.json()),
+                        (second.status, await second.json()),
+                    )
+                    single_status = single.status
+                finally:
+                    logger.removeHandler(handler)
+                    await client.close()
+                for status, body in outcomes:
+                    self.assertEqual(status, 503)
+                    self.assertEqual(body["error"]["code"], "work_webhook_not_configured")
+                    for name in names:
+                        self.assertIn(name, body["error"]["message"])
+                    encoded = json.dumps(body)
+                    self.assertNotIn(WEBHOOK_KEY, encoded)
+                    self.assertNotIn(WORK_WEBHOOK_KEY, encoded)
+                    self.assertNotIn(DEFAULT_GROK_PEBBLE_WEBHOOK_URL, encoded)
+                    self.assertNotIn(WORK_WEBHOOK_URL, encoded)
+                text = stream.getvalue()
+                self.assertIn("work_webhook_not_configured", text)
+                self.assertIn("press_count=2", text)
+                self.assertIn("destination=work", text)
+                for name in names:
+                    self.assertIn(name, text)
+                self.assertNotIn(WEBHOOK_KEY, text)
+                self.assertNotIn(WORK_WEBHOOK_KEY, text)
+                self.assertNotIn(DEFAULT_GROK_PEBBLE_WEBHOOK_URL, text)
+                self.assertNotIn(RING, text)
+                self.assertEqual(single_status, 200)
+                self.assertEqual(len(self.forwarder.calls), 1)
+                self.assertEqual(self.forwarder.calls[0]["url"], DEFAULT_GROK_PEBBLE_WEBHOOK_URL)
+                self.assertEqual(self.forwarder.calls[0]["key"], WEBHOOK_KEY)
+                self.assertEqual(self.forwarder.calls[0]["payload"]["event_id"], f"still-personal-{index}")
+
+    async def test_real_work_forwarder_posts_the_work_bearer_only(self):
+        captured = {"personal": 0, "work": None}
+
+        async def personal(_request: web.Request) -> web.Response:
+            captured["personal"] += 1
+            return web.json_response({"ok": True})
+
+        async def work(request: web.Request) -> web.Response:
+            captured["work"] = {
+                "authorization": request.headers.get("Authorization"),
+                "body": await request.json(),
+            }
+            return web.json_response({"ok": True})
+
+        hook = web.Application()
+        hook.router.add_post("/personal", personal)
+        hook.router.add_post("/work", work)
+        server = TestServer(hook)
+        await server.start_server()
+        await self.client.close()
+        self.client = TestClient(
+            TestServer(
+                app_for(
+                    self.root,
+                    None,
+                    self.transcriber,
+                    grok_pebble_webhook_url=str(server.make_url("/personal")),
+                    grok_pebble_work_webhook_url=str(server.make_url("/work")),
+                )
+            )
+        )
+        await self.client.start_server()
+        try:
+            response = await self.post_json(
+                self.json_body(event_id="live-double", event_type="double-click-hold")
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(captured["personal"], 0)
+            self.assertEqual(captured["work"]["authorization"], f"Bearer {WORK_WEBHOOK_KEY}")
+            self.assertEqual(captured["work"]["body"]["event_type"], "double-click-hold")
+            self.assertEqual(captured["work"]["body"]["transcript"], "Hello from json")
+            self.assertNotIn("audio", captured["work"]["body"])
+            dumped = json.dumps(captured["work"]["body"])
+            self.assertNotIn(AUDIO.decode(), dumped)
+            self.assertNotIn(RING, dumped)
+            self.assertNotIn(WEBHOOK_KEY, dumped)
+            self.assertNotIn(WORK_WEBHOOK_KEY, dumped)
+        finally:
+            await server.close()
 
     def json_body(self, **extra):
         payload = {

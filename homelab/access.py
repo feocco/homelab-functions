@@ -538,9 +538,14 @@ HTTP_ONLY_OPERATIONS: tuple[HttpOnlyOperation, ...] = (
         summary="Relay a Pebble Index ring recording",
         description=(
             "Accept a Pebble Index webhook (multipart audio or JSON text) and forward JSON "
-            "to the configured Grok webhook. Only allowlisted fields are forwarded. Raw audio "
-            "stays on this host until its TTL. Event timestamps must be within five minutes "
-            "of the server clock, and the request body is limited to 9 MiB. "
+            "to the Grok webhook for that press count. single-click-hold uses "
+            "GROK_PEBBLE_WEBHOOK_URL and GROK_PEBBLE_WEBHOOK_KEY. double-click-hold uses "
+            "GROK_PEBBLE_WORK_WEBHOOK_URL and GROK_PEBBLE_WORK_WEBHOOK_KEY, which have no "
+            "default. Any other gesture is rejected. A missing work webhook returns 503 "
+            "work_webhook_not_configured and is not sent to the personal webhook. Only "
+            "allowlisted fields are forwarded. Raw audio stays on this host until its TTL. "
+            "Event timestamps must be within five minutes of the server clock, and the "
+            "request body is limited to 9 MiB. "
             f"The phone posts to {PEBBLE_PHONE_URL} with Authorization: Bearer $PEBBLE_RING_TOKEN. "
             "This route is HTTP-only. It is not a HomelabFunctionsClient method or an MCP tool."
         ),

@@ -599,7 +599,7 @@ curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \\
             ("transcription", "text or JSON", "string", "When missing and audio is present, xAI transcribes it."),
             ("recordedAt", "text or JSON", "string", "Unix milliseconds within five minutes of the server clock. One of recordedAt or timestamp is required."),
             ("timestamp", "text or JSON", "string", "ISO-8601 time within five minutes of the server clock. One of recordedAt or timestamp is required."),
-            ("event_type", "text, JSON, or X-Index-Trigger", "string", "Gesture, such as single-click-hold."),
+            ("event_type", "text, JSON, or X-Index-Trigger", "string", "single-click-hold or double-click-hold. Other values are rejected."),
             ("event_id", "text, JSON, or X-Index-Delivery", "string", "Dedupe key. Derived when the phone omits it."),
             ("client", "text or JSON", "string", "Pebble sends ring."),
             ("audio_duration_seconds", "text or JSON", "number", "Filled from speech-to-text when audio is transcribed here."),
@@ -706,8 +706,10 @@ def _main() -> str:
       <tr>{_cell("Variable", _code("HOMELAB_FUNCTIONS_URL"))}{_cell("Default", _code(DEFAULT_FUNCTIONS_URL))}{_cell("Notes", "Containers on the homelab network use " + _code("http://homelab-functions:8091") + ".")}</tr>
       <tr>{_cell("Variable", _code("HOMELAB_FUNCTIONS_TOKEN"))}{_cell("Default", "None. Required.")}{_cell("Notes", "Must match the server’s " + _code("HOMELAB_FUNCTIONS_TOKEN") + ". Does not authorize " + _code("POST /v1/pebble") + ".")}</tr>
       <tr>{_cell("Variable", _code("PEBBLE_RING_TOKEN"))}{_cell("Default", "None. Required for the ring route.")}{_cell("Notes", "Dedicated bearer for " + _code("POST /v1/pebble") + ". Does not authorize any other route.")}</tr>
-      <tr>{_cell("Variable", _code("GROK_PEBBLE_WEBHOOK_KEY"))}{_cell("Default", "None. Required to forward.")}{_cell("Notes", "Bearer sent with the forwarded JSON. Never logged.")}</tr>
-      <tr>{_cell("Variable", _code("GROK_PEBBLE_WEBHOOK_URL"))}{_cell("Default", "Cursor automation webhook")}{_cell("Notes", "JSON-only destination. Raw audio is not sent here.")}</tr>
+      <tr>{_cell("Variable", _code("GROK_PEBBLE_WEBHOOK_KEY"))}{_cell("Default", "None. Required for single-click-hold.")}{_cell("Notes", "Bearer sent with the personal webhook JSON. Never logged.")}</tr>
+      <tr>{_cell("Variable", _code("GROK_PEBBLE_WEBHOOK_URL"))}{_cell("Default", "Cursor automation webhook")}{_cell("Notes", "Personal destination for single-click-hold. Raw audio is not sent here.")}</tr>
+      <tr>{_cell("Variable", _code("GROK_PEBBLE_WORK_WEBHOOK_KEY"))}{_cell("Default", "None.")}{_cell("Notes", "Bearer for double-click-hold. Missing key or URL returns 503 and does not use the personal webhook.")}</tr>
+      <tr>{_cell("Variable", _code("GROK_PEBBLE_WORK_WEBHOOK_URL"))}{_cell("Default", "None.")}{_cell("Notes", "Work destination for double-click-hold. No default URL.")}</tr>
       <tr>{_cell("Variable", _code("XAI_API_KEY"))}{_cell("Default", "None.")}{_cell("Notes", "Used only when audio arrives without a transcription.")}</tr>
       <tr>{_cell("Variable", _code("PEBBLE_AUDIO_TTL_SECONDS"))}{_cell("Default", _code("86400"))}{_cell("Notes", "How long local audio is kept. The event-id dedupe row is kept.")}</tr>
     </tbody>
