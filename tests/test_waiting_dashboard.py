@@ -11,16 +11,25 @@ from unittest.mock import patch
 from aiohttp.test_utils import TestClient, TestServer
 
 from homelab.server import create_app
-from homelab.waiting import ItemState, WaitingSourceError, run_refresh_loop
-from homelab.waiting_web import BOARD_KEY, FEEDBACK_KEY
+from homelab.waiting import CATEGORY_LABELS, CATEGORY_ORDER, Category, WaitingSourceError, run_refresh_loop
+from homelab.waiting_web import BOARD_KEY
 from waiting_support import TOKEN, FakeCursor, StaticSource, make_item, waiting_config
 
 
 ORIGIN = {"Origin": "http://waiting.test"}
 
 
+SECRET_ID = make_item(14, category=Category.SECRET).id
+MERGE_ID = "feocco/homelab-config#15:approve_merge"
+COPY_ID = make_item(16, category=Category.COPY, need="Run the fake apply").id
+
+
 class DashboardHarness(unittest.IsolatedAsyncioTestCase):
-    items = (make_item(14), make_item(15, repo="feocco/homelab-config", state=ItemState.FAILING))
+    items = (
+        make_item(14, category=Category.SECRET),
+        make_item(15, repo="feocco/homelab-config", category=Category.APPROVE_MERGE, need="Approve and merge “Fake”"),
+        make_item(16, category=Category.COPY, need="Run the fake apply"),
+    )
     cursor_enabled = True
     config_overrides: dict = {"dashboard_public_url": "http://waiting.test"}
 
@@ -36,7 +45,6 @@ class DashboardHarness(unittest.IsolatedAsyncioTestCase):
         self.http = TestClient(TestServer(app), headers={"Host": "waiting.test"})
         await self.http.start_server()
         self.board = app[BOARD_KEY]
-        self.feedback = app[FEEDBACK_KEY]
         await self.board.refresh()
 
     async def asyncTearDown(self):
@@ -110,11 +118,15 @@ class SessionBoundaryTests(DashboardHarness):
 
     async def test_signed_in_feedback_still_needs_same_origin(self):
         await self.sign_in()
-        body = {"item_id": "feocco/homelab-functions#14", "feedback": "Hi"}
-        for headers in ({}, {"Origin": "https://evil.test"}):
-            response = await self.http.post("/waiting/feedback", json=body, headers=headers)
-            self.assertEqual(response.status, 403)
+        for path, body in (
+            ("/waiting/feedback", {"item_id": SECRET_ID, "feedback": "Hi"}),
+            ("/waiting/handled", {"item_id": SECRET_ID}),
+        ):
+            for headers in ({}, {"Origin": "https://evil.test"}):
+                response = await self.http.post(path, json=body, headers=headers)
+                self.assertEqual(response.status, 403, path)
         self.assertEqual(self.cursor.launches, [])
+        self.assertIn(SECRET_ID, [item["id"] for item in self.board.payload()["items"]])
 
     async def test_sign_out_clears_the_session(self):
         await self.sign_in()
@@ -142,9 +154,19 @@ class OneDocumentTests(DashboardHarness):
         self.assertEqual(embedded, snapshot)
         self.assertEqual(snapshot, v1)
         self.assertEqual(v1, streamed)
-        self.assertEqual(v1["schema"], "waiting-on-me.v1")
-        self.assertEqual([item["id"] for item in v1["items"]], ["feocco/homelab-functions#14", "feocco/homelab-config#15"])
-        self.assertTrue(all(item["url"].startswith("https://github.com/") for item in v1["items"]))
+        self.assertEqual(v1["schema"], "waiting-on-me.v2")
+        self.assertEqual([item["id"] for item in v1["items"]], [MERGE_ID, SECRET_ID, COPY_ID])
+        self.assertEqual(
+            [(entry["id"], entry["label"], entry["count"]) for entry in v1["categories"]],
+            [(category.value, CATEGORY_LABELS[category], int(category in (Category.APPROVE_MERGE, Category.SECRET, Category.COPY))) for category in CATEGORY_ORDER],
+        )
+        self.assertEqual(v1["total"], 3)
+        for item in v1["items"]:
+            self.assertTrue(item["need"] and item["why"])
+            self.assertTrue(item["source"]["url"].startswith("https://github.com/"))
+            self.assertIn(item["action"]["type"], ("open", "copy"))
+        copy = next(item for item in v1["items"] if item["id"] == COPY_ID)
+        self.assertEqual(copy["action"], {"type": "copy", "label": "Copy", "value": "echo fake"})
 
     async def test_page_csp_pins_its_only_script_and_style(self):
         await self.sign_in()
@@ -165,13 +187,13 @@ class OneDocumentTests(DashboardHarness):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
 
     async def test_hostile_titles_cannot_break_out_of_the_embedded_snapshot(self):
-        self.source.items = [make_item(20, title="</script><script>alert(1)</script>")]
+        self.source.items = [make_item(20, need="</script><script>alert(1)</script>")]
         await self.board.refresh()
         await self.sign_in()
         html = await (await self.http.get("/waiting")).text()
         self.assertNotIn("<script>alert(1)", html)
         embedded = json.loads(re.search(r'id="snapshot">(.*?)</script>', html).group(1))
-        self.assertEqual(embedded["items"][0]["title"], "</script><script>alert(1)</script>")
+        self.assertEqual(embedded["items"][0]["need"], "</script><script>alert(1)</script>")
 
 
 class LiveUpdateTests(DashboardHarness):
@@ -179,14 +201,15 @@ class LiveUpdateTests(DashboardHarness):
         await self.sign_in()
         stream = asyncio.create_task(self.first_events(2))
         await asyncio.sleep(0.05)
-        self.source.items.append(make_item(16, title="Arrived later"))
+        arrival = make_item(30, category=Category.QUESTION, need="Arrived later?")
+        self.source.items.append(arrival)
         await self.board.refresh()
         (first_name, first), (second_name, second) = await stream
 
         self.assertEqual((first_name, second_name), ("snapshot", "snapshot"))
         self.assertGreater(second["version"], first["version"])
-        self.assertNotIn("feocco/homelab-functions#16", [item["id"] for item in first["items"]])
-        self.assertIn("feocco/homelab-functions#16", [item["id"] for item in second["items"]])
+        self.assertNotIn(arrival.id, [item["id"] for item in first["items"]])
+        self.assertIn(arrival.id, [item["id"] for item in second["items"]])
         self.assertEqual(second, await (await self.http.get("/waiting/snapshot")).json())
 
     async def test_idle_stream_sends_heartbeats(self):
@@ -207,19 +230,59 @@ class LiveUpdateTests(DashboardHarness):
         await asyncio.sleep(0.05)
         self.assertEqual(self.board.subscriber_count(), 0)
 
-    async def test_feedback_updates_the_stream(self):
+    async def test_items_handled_on_github_leave_the_stream(self):
         await self.sign_in()
         stream = asyncio.create_task(self.first_events(2))
         await asyncio.sleep(0.05)
-        response = await self.http.post(
-            "/waiting/feedback",
-            json={"item_id": "feocco/homelab-functions#14", "feedback": "Rename it.", "request_id": "dash-request-1"},
-            headers=ORIGIN,
-        )
-        self.assertEqual(response.status, 200)
+        self.source.items = [item for item in self.source.items if item.id != SECRET_ID]
+        await self.board.refresh()
         (_, before), (_, after) = await stream
-        self.assertIsNone(before["items"][0]["feedback"])
-        self.assertEqual(after["items"][0]["feedback"]["agent_id"], (await response.json())["agent"]["id"])
+        self.assertIn(SECRET_ID, [item["id"] for item in before["items"]])
+        self.assertNotIn(SECRET_ID, [item["id"] for item in after["items"]])
+
+    async def test_joe_marking_done_removes_the_item_live_everywhere(self):
+        await self.sign_in()
+        stream = asyncio.create_task(self.first_events(2))
+        await asyncio.sleep(0.05)
+        response = await self.http.post("/waiting/handled", json={"item_id": COPY_ID}, headers=ORIGIN)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"status": "handled", "item_id": COPY_ID})
+        (_, before), (_, after) = await stream
+        self.assertIn(COPY_ID, [item["id"] for item in before["items"]])
+        self.assertNotIn(COPY_ID, [item["id"] for item in after["items"]])
+        v1 = await (await self.http.get("/v1/waiting", headers={"Authorization": f"Bearer {TOKEN}"})).json()
+        self.assertNotIn(COPY_ID, [item["id"] for item in v1["items"]])
+        await self.board.refresh()
+        self.assertNotIn(COPY_ID, [item["id"] for item in self.board.payload()["items"]])
+
+    async def test_only_a_signed_in_human_can_mark_done_and_never_for_merges(self):
+        bearer = await self.http.post(
+            "/waiting/handled",
+            json={"item_id": SECRET_ID},
+            headers={**ORIGIN, "Authorization": f"Bearer {TOKEN}"},
+        )
+        self.assertEqual(bearer.status, 401)
+        await self.sign_in()
+        merge = await self.http.post("/waiting/handled", json={"item_id": MERGE_ID}, headers=ORIGIN)
+        self.assertEqual(merge.status, 409)
+        self.assertEqual((await merge.json())["error"]["code"], "merge_on_github")
+        unknown = await self.http.post("/waiting/handled", json={"item_id": "feocco/x#1:secret:0123456789"}, headers=ORIGIN)
+        self.assertEqual(unknown.status, 404)
+        invalid = await self.http.post("/waiting/handled", json={"item_id": "not an id"}, headers=ORIGIN)
+        self.assertEqual(invalid.status, 400)
+        self.assertEqual(
+            sorted(item["id"] for item in self.board.payload()["items"]),
+            sorted((MERGE_ID, SECRET_ID, COPY_ID)),
+        )
+
+    async def test_page_offers_one_primary_action_and_a_source_link_per_card(self):
+        await self.sign_in()
+        html = await (await self.http.get("/waiting")).text()
+        template = re.search(r'<template id="item-template">(.*?)</template>', html, re.S).group(1)
+        self.assertEqual(template.count('class="button primary action-open"'), 1)
+        self.assertEqual(template.count('class="button primary action-copy"'), 1)
+        self.assertEqual(template.count('class="source"'), 1)
+        self.assertNotIn("merge", template.lower().replace("merged or closed on github", ""))
 
     async def test_refresh_loop_refreshes_on_its_interval(self):
         sleeps = []
@@ -229,13 +292,14 @@ class LiveUpdateTests(DashboardHarness):
             if len(sleeps) == 2:
                 raise asyncio.CancelledError
 
-        self.source.items.append(make_item(17))
+        later = make_item(17, category=Category.EVIDENCE, need="Check the fake trace")
+        self.source.items.append(later)
         fetches = self.source.fetches
         with self.assertRaises(asyncio.CancelledError):
-            await run_refresh_loop(self.board, self.feedback, sleep=fake_sleep)
+            await run_refresh_loop(self.board, sleep=fake_sleep)
         self.assertEqual(self.source.fetches - fetches, 2)
         self.assertTrue(all(seconds > 3500 for seconds in sleeps))
-        self.assertIn("feocco/homelab-functions#17", [item["id"] for item in self.board.payload()["items"]])
+        self.assertIn(later.id, [item["id"] for item in self.board.payload()["items"]])
 
 
 class DegradedStateTests(DashboardHarness):
@@ -280,7 +344,7 @@ class UnconfiguredTests(unittest.IsolatedAsyncioTestCase):
                 ).json()
                 feedback = await http.post(
                     "/v1/waiting/feedback",
-                    json={"item_id": "feocco/homelab-functions#14", "feedback": "Hi"},
+                    json={"item_id": SECRET_ID, "feedback": "Hi"},
                     headers={"Authorization": f"Bearer {TOKEN}"},
                 )
                 feedback_error = (await feedback.json())["error"]

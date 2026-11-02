@@ -32,6 +32,7 @@ from homelab.client import HomelabFunctionsClient, HomelabFunctionsError
 from homelab.consumers import CONSUMERS, consumer_matrix_markdown
 from homelab.server import Config, HomeAssistantError, create_app
 from homelab.waiting_cli import verify as verify_dashboard
+from homelab.waiting import Category
 from waiting_support import FakeCursor, StaticSource, make_item
 
 
@@ -220,10 +221,11 @@ CONTRACTS = (
         "operation_id": "get_waiting_items",
         "method": "GET",
         "path": "/v1/waiting",
-        "summary": "Return the Waiting on me snapshot",
+        "summary": "Return Joe's Waiting on me inbox",
         "description": (
-            "Return the open pull requests waiting on Joe, with check state and feedback agents. "
-            "This is the same snapshot document the dashboard page and its SSE stream publish."
+            "Return only the items that need Joe, in seven categories, each with what is needed, why, "
+            "one primary action, and a source link. This is the same snapshot document the inbox page "
+            "and its SSE stream publish."
         ),
         "domain": "Waiting on me",
         "parameters": (),
@@ -233,9 +235,9 @@ CONTRACTS = (
         "operation_id": "send_waiting_feedback",
         "method": "POST",
         "path": "/v1/waiting/feedback",
-        "summary": "Send feedback on a waiting item to its Cursor agent",
+        "summary": "Send feedback on an inbox item to its Cursor agent",
         "description": (
-            "Send feedback on one waiting item. The first feedback launches one Cursor agent that "
+            "Send feedback on one inbox item. The first feedback launches one Cursor agent that "
             "opens one pull request; later feedback goes to that same agent. Reuse request_id to "
             "retry safely. Feedback never approves, merges, or deploys anything."
         ),
@@ -248,7 +250,7 @@ CONTRACTS = (
         "errors": (
             INVALID_REQUEST,
             UNAUTHORIZED,
-            {"status": "404", "description": "No waiting item has that id"},
+            {"status": "404", "description": "No inbox item has that id"},
             {"status": "409", "description": "request_id reused for other feedback, or the agent is busy"},
             {"status": "502", "description": "Cursor rejected the request"},
             {"status": "503", "description": "Feedback is off because CURSOR_API_KEY is not set"},
@@ -265,6 +267,7 @@ EXPECTED_DASHBOARD_ROUTES = (
     ("GET", "/waiting/events", "session"),
     ("GET", "/waiting/snapshot", "session"),
     ("POST", "/waiting/feedback", "session"),
+    ("POST", "/waiting/handled", "session"),
 )
 
 EXPECTED_IDS = (
@@ -924,7 +927,7 @@ class ClientHelperTests(unittest.TestCase):
             ),
             (
                 lambda: homelab.send_waiting_feedback(
-                    "feocco/homelab-functions#14",
+                    "feocco/homelab-config#41:secret:3f9a1c2b7d",
                     "Rename the flag.",
                     request_id="helper-request-1",
                     service_url=base,
@@ -935,7 +938,7 @@ class ClientHelperTests(unittest.TestCase):
                 "/v1/waiting/feedback",
                 {},
                 {
-                    "item_id": "feocco/homelab-functions#14",
+                    "item_id": "feocco/homelab-config#41:secret:3f9a1c2b7d",
                     "feedback": "Rename the flag.",
                     "request_id": "helper-request-1",
                 },
@@ -1255,7 +1258,12 @@ class EndToEndTests(unittest.TestCase):
             create_app(
                 write_runtime(Path(self.tmpdir.name)),
                 ha_client=self.fake,
-                waiting_source=StaticSource([make_item(14), make_item(15, repo="feocco/homelab-config")]),
+                waiting_source=StaticSource(
+                    [
+                        make_item(14, category=Category.SECRET),
+                        make_item(15, repo="feocco/homelab-config", category=Category.APPROVE_MERGE, need="Approve and merge “Fake”"),
+                    ]
+                ),
                 cursor_agents=self.cursor,
             )
         )
@@ -1702,12 +1710,12 @@ class EndToEndTests(unittest.TestCase):
         mcp_error, mcp_snapshot = self.call_tool("get_waiting_items")
         self.assertFalse(mcp_error)
         self.assertEqual(mcp_snapshot, snapshot)
+        item_id = make_item(14, category=Category.SECRET).id
         self.assertEqual(
             [item["id"] for item in snapshot["items"]],
-            ["feocco/homelab-functions#14", "feocco/homelab-config#15"],
+            ["feocco/homelab-config#15:approve_merge", item_id],
         )
 
-        item_id = "feocco/homelab-functions#14"
         launched = self.api.send_waiting_feedback(item_id, "Client note.", request_id="parity-client-1")
         self.assertEqual(launched["delivery"], "launch")
         follow_error, followed = self.call_tool(
@@ -1727,7 +1735,7 @@ class EndToEndTests(unittest.TestCase):
 
         unknown_error, unknown = self.call_tool(
             "send_waiting_feedback",
-            {"item_id": "feocco/not-waiting#1", "feedback": "Hi."},
+            {"item_id": "feocco/not-waiting#1:secret:0123456789", "feedback": "Hi."},
         )
         self.assertTrue(unknown_error)
         self.assertEqual((unknown["status"], unknown["code"]), (404, "unknown_item"))
@@ -1737,8 +1745,7 @@ class EndToEndTests(unittest.TestCase):
 
         report = verify_dashboard(self.url, TOKEN)
         self.assertTrue(report["ok"], json.dumps(report, indent=2))
-        linked = self.api.get_waiting_items()["items"][0]["feedback"]
-        self.assertEqual((linked["agent_id"], linked["sent_count"]), (launched["agent"]["id"], 2))
+        self.assertEqual([item["id"] for item in self.api.get_waiting_items()["items"]], [item["id"] for item in snapshot["items"]])
 
 
 EXPECTED_CALLERS = (

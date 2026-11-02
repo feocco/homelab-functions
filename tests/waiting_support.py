@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 
 from homelab.json_http import JsonResponse, TransportError
 from homelab.server import Config
-from homelab.waiting import CursorCallError, FailingCheck, ItemState, WaitingItem
+from homelab.waiting import Category, CursorCallError, Inbox, InboxItem, PrimaryAction
 
 
 TOKEN = "waiting-test-token-0123456789"
@@ -21,41 +22,51 @@ def make_item(
     number: int = 14,
     *,
     repo: str = "feocco/homelab-functions",
-    state: ItemState = ItemState.READY,
-    title: str = "Fake pull request",
+    category: Category = Category.SECRET,
+    need: str = "Add the fake key",
+    why: str = "The fake service cannot start without it.",
     updated_at: str = "2026-11-01T12:00:00+00:00",
-    failing: tuple[FailingCheck, ...] = (),
-    cross_repository: bool = False,
-) -> WaitingItem:
-    return WaitingItem(
+    head_ref: str | None = None,
+    pr_url: str | None = None,
+) -> InboxItem:
+    source_url = f"https://github.com/{repo}/pull/{number}"
+    if category is Category.APPROVE_MERGE:
+        item_id = f"{repo}#{number}:approve_merge"
+        action = PrimaryAction("open", "Review and merge on GitHub", url=source_url)
+    else:
+        item_id = f"{repo}#{number}:{category.value}:{hashlib.sha1(need.encode()).hexdigest()[:10]}"
+        if category is Category.COPY:
+            action = PrimaryAction("copy", "Copy", value="echo fake")
+        else:
+            action = PrimaryAction("open", "Open", url=source_url)
+    return InboxItem(
+        id=item_id,
+        category=category,
+        need=need,
+        why=why,
+        action=action,
+        source_url=source_url,
+        source_label=f"{repo}#{number}",
         repo=repo,
-        number=number,
-        title=title,
-        url=f"https://github.com/{repo}/pull/{number}",
-        author="cursor",
-        state=state,
-        checks={"ready": "passed", "failing": "failing", "running": "running"}.get(state.value, "passed"),
-        failing_checks=failing,
-        created_at="2026-11-01T10:00:00+00:00",
         updated_at=updated_at,
-        head_ref=f"cursor/fake-{number}",
-        cross_repository=cross_repository,
+        head_ref=head_ref,
+        pr_url=pr_url,
     )
 
 
 class StaticSource:
     owner = "feocco"
 
-    def __init__(self, items: list[WaitingItem] | None = None) -> None:
+    def __init__(self, items: list[InboxItem] | None = None) -> None:
         self.items = list(items or [])
         self.error: Exception | None = None
         self.fetches = 0
 
-    async def fetch(self) -> list[WaitingItem]:
+    async def fetch(self) -> Inbox:
         self.fetches += 1
         if self.error is not None:
             raise self.error
-        return list(self.items)
+        return Inbox(list(self.items))
 
 
 @dataclass
@@ -102,9 +113,8 @@ class FakeCursor:
     follow_up_failures: list[CursorCallError] = field(default_factory=list)
     existing_agents: set[str] = field(default_factory=set)
     gate: asyncio.Event | None = None
-    pr_urls: dict[str, str] = field(default_factory=dict)
 
-    async def launch(self, *, agent_id: str, name: str, prompt: str, item: WaitingItem) -> str:
+    async def launch(self, *, agent_id: str, name: str, prompt: str, item: InboxItem) -> str:
         if self.gate is not None:
             await self.gate.wait()
         self.launches.append({"agent_id": agent_id, "name": name, "prompt": prompt, "item": item.id})
@@ -125,9 +135,6 @@ class FakeCursor:
             raise self.follow_up_failures.pop(0)
         self.follow_ups.append((agent_id, prompt))
         return "followup"
-
-    async def pull_request_url(self, agent_id: str) -> str | None:
-        return self.pr_urls.get(agent_id)
 
 
 def waiting_config(tmp: Path, **overrides: Any) -> Config:

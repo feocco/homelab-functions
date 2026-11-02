@@ -1,4 +1,4 @@
-"""Browser routes for the Waiting on me dashboard.
+"""Browser routes for the Waiting on me inbox.
 
 The browser signs in once with `HOMELAB_FUNCTIONS_TOKEN` and keeps only an
 HMAC-signed session cookie. That cookie opens the dashboard routes in
@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from .access import DASHBOARD_ROUTES
-from .waiting import FeedbackError, FeedbackService, WaitingBoard, validate_feedback
+from .waiting import FeedbackError, FeedbackService, WaitingBoard, validate_feedback, validate_item_id
 
 
 SESSION_COOKIE = "waiting_session"
@@ -190,6 +190,23 @@ async def feedback(request: web.Request) -> web.Response:
     return await submit_feedback(request.app[FEEDBACK_KEY], payload)
 
 
+async def handled(request: web.Request) -> web.Response:
+    """Joe marks an item done. Session only: agents cannot clear Joe's inbox."""
+
+    if not _signed_in(request):
+        return _unauthorized()
+    if not _same_origin(request):
+        return _json_error(403, "cross_origin", "Marking an item done must come from the inbox page")
+    try:
+        payload = await request.json()
+        result = request.app[BOARD_KEY].mark_handled(validate_item_id(payload))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _json_error(400, "invalid_request", "Request body must be JSON")
+    except FeedbackError as exc:
+        return _json_error(exc.status.value, exc.code, str(exc), exc.detail)
+    return web.json_response(result)
+
+
 async def submit_feedback(service: FeedbackService, payload: Any) -> web.Response:
     """Shared by the dashboard route and `send_waiting_feedback`."""
 
@@ -210,6 +227,7 @@ def register_dashboard_routes(app: web.Application) -> None:
         ("GET", "/waiting/events"): events,
         ("GET", "/waiting/snapshot"): snapshot,
         ("POST", "/waiting/feedback"): feedback,
+        ("POST", "/waiting/handled"): handled,
     }
     declared = {(route.method, route.path) for route in DASHBOARD_ROUTES}
     if set(handlers) != declared:
@@ -306,11 +324,11 @@ def dashboard_html(payload: dict[str, Any]) -> str:
   </div>
 </header>
 <main class="board">
-  <p class="summary" id="summary"></p>
+  <p class="summary" id="summary" aria-live="polite"></p>
   <div class="notices" id="notices"></div>
-  <p class="policy" id="policy"></p>
   <div id="sections"></div>
-  <p class="empty" id="empty" hidden>Nothing is waiting on you.</p>
+  <p class="empty" id="empty" hidden>Nothing needs you right now.</p>
+  <p class="policy" id="policy"></p>
 </main>
 <template id="section-template">
   <section class="section">
@@ -321,28 +339,28 @@ def dashboard_html(payload: dict[str, Any]) -> str:
 <template id="item-template">
   <li class="item">
     <div class="item-body">
-      <div class="item-head">
-        <span class="repo"></span><span class="number"></span><span class="chip new-chip">New</span>
-      </div>
-      <a class="title" target="_blank" rel="noopener noreferrer"></a>
-      <p class="meta"><span class="checks"></span><span class="sep" aria-hidden="true">·</span><span class="author"></span><span class="sep" aria-hidden="true">·</span><span class="age"></span></p>
-      <ul class="failing"></ul>
-      <p class="agent" hidden>
-        <span class="agent-label">Cursor agent</span>
-        <a class="agent-link" target="_blank" rel="noopener noreferrer">Open agent</a>
-        <a class="agent-pr" target="_blank" rel="noopener noreferrer" hidden></a>
-        <span class="agent-count"></span>
+      <p class="need"></p>
+      <p class="why"></p>
+      <div class="copy-box" hidden><code class="copy-value"></code></div>
+      <p class="meta">
+        <a class="source" target="_blank" rel="noopener noreferrer"></a>
+        <span class="clears" hidden>Leaves the inbox when merged or closed on GitHub</span>
+        <span class="chip new-chip">New</span>
       </p>
     </div>
     <div class="item-actions">
-      <a class="button secondary open-pr" target="_blank" rel="noopener noreferrer">Open PR</a>
-      <button class="button feedback-toggle" type="button" aria-expanded="false">Send feedback</button>
+      <a class="button primary action-open" target="_blank" rel="noopener noreferrer" hidden></a>
+      <button class="button primary action-copy" type="button" hidden></button>
+      <div class="secondary">
+        <button class="link-button done" type="button">Done</button>
+        <button class="link-button feedback-toggle" type="button" aria-expanded="false">Send feedback</button>
+      </div>
     </div>
     <form class="feedback-form" hidden>
-      <label class="feedback-label">Feedback for the Cursor agent
+      <label class="feedback-label">Feedback for a Cursor agent
         <textarea name="feedback" rows="3" maxlength="4000" required></textarea>
       </label>
-      <p class="hint"></p>
+      <p class="hint">The first note starts one Cursor agent for this item. It opens one pull request for you to review. Later notes go to the same agent.</p>
       <div class="form-row">
         <button class="button primary send" type="submit">Send</button>
         <button class="button ghost cancel" type="button">Cancel</button>

@@ -1,71 +1,97 @@
-"""Read open pull requests for the Waiting on me dashboard with a GitHub App.
+"""Build Joe's Waiting on me inbox from GitHub with a read-only GitHub App.
 
 The App authenticates with a short-lived RS256 JWT and exchanges it for an
 installation token. A token with any permission other than `read` is refused,
 and only GraphQL queries are sent, so this module cannot change GitHub.
+
+Two sources become inbox items:
+
+- An open, non-draft pull request with passing (or no) checks, no requested
+  changes, and no merge conflict becomes one "PR approve/merge" item.
+- An unchecked ask line in a pull request or issue body or comment becomes
+  one item in its category. Agents write ask lines like this:
+
+      - [ ] **Joe: secret** Set `DASHBOARD_GH_APP_KEY`. Why: the inbox cannot read GitHub. Action: https://github.com/…
+      - [ ] **Joe: copy** Publish the DNS record. Why: the route needs it. Copy: `./scripts/dispatch-route-dns --mode apply`
+
+  Kinds: deploy, secret (or key), infra (or dns), question, copy, evidence.
+  Ticking the box, deleting the line, or closing the source removes the item.
+  Asks on pull requests merged in the last 14 days still count, because a
+  deploy usually waits on a merged change.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from .json_http import JsonTransport, TransportError
-from .waiting import FailingCheck, ItemState, WaitingItem, WaitingSourceError
+from .waiting import Category, Inbox, InboxItem, PrimaryAction, RejectedAsk, WaitingSourceError
 
 
 GITHUB_API_URL = "https://api.github.com"
-SEARCH_LIMIT = 50
+OPEN_LIMIT = 50
+MERGED_LIMIT = 30
+MERGED_WINDOW_DAYS = 14
 _TOKEN_REFRESH_MARGIN_SECONDS = 300
-_FAILED_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
-_FAILED_STATUSES = {"FAILURE", "ERROR"}
 _MUTATION = re.compile(r"^\s*mutation\b", re.IGNORECASE)
 
-WAITING_QUERY = """
-query WaitingOnMe($search: String!) {
-  search(query: $search, type: ISSUE, first: %d) {
-    nodes {
-      ... on PullRequest {
-        number
-        title
-        url
-        createdAt
-        updatedAt
-        headRefName
-        isCrossRepository
-        reviewDecision
-        author { login }
-        repository { nameWithOwner }
-        commits(last: 1) {
-          nodes {
-            commit {
-              statusCheckRollup {
-                state
-                contexts(first: 50) {
-                  nodes {
-                    __typename
-                    ... on CheckRun { name conclusion detailsUrl }
-                    ... on StatusContext { context state targetUrl }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+_COMMENTS = "comments(last: 30) { nodes { body url updatedAt } }"
+_SOURCE_FIELDS = f"""
+      __typename
+      ... on PullRequest {{
+        number title url body updatedAt state isDraft
+        headRefName isCrossRepository reviewDecision mergeable
+        repository {{ nameWithOwner }}
+        commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
+        {_COMMENTS}
+      }}
+      ... on Issue {{
+        number title url body updatedAt state
+        repository {{ nameWithOwner }}
+        {_COMMENTS}
+      }}"""
+INBOX_QUERY = f"""
+query WaitingOnMe($open: String!, $merged: String!) {{
+  open: search(query: $open, type: ISSUE, first: {OPEN_LIMIT}) {{ nodes {{{_SOURCE_FIELDS}
+  }} }}
+  merged: search(query: $merged, type: ISSUE, first: {MERGED_LIMIT}) {{ nodes {{{_SOURCE_FIELDS}
+  }} }}
+}}
+"""
+
+ASK_KINDS: dict[str, Category] = {
+    "deploy": Category.DEPLOY,
+    "secret": Category.SECRET,
+    "key": Category.SECRET,
+    "infra": Category.INFRA,
+    "dns": Category.INFRA,
+    "question": Category.QUESTION,
+    "copy": Category.COPY,
+    "evidence": Category.EVIDENCE,
 }
-""" % SEARCH_LIMIT
+ACTION_LABELS: dict[Category, str] = {
+    Category.APPROVE_MERGE: "Review and merge on GitHub",
+    Category.DEPLOY: "Review the deploy",
+    Category.SECRET: "Add the secret",
+    Category.INFRA: "Make the decision",
+    Category.QUESTION: "Answer on GitHub",
+    Category.COPY: "Copy",
+    Category.EVIDENCE: "Review the evidence",
+}
+_ASK_LINE = re.compile(r"^\s*[-*]\s+\[(?P<mark>[ xX])\]\s+\*\*Joe:\s*(?P<kind>[^*]+?)\s*\*\*\s*(?P<rest>.*)$")
+_ASK_TAIL = re.compile(r"^(?P<why>.+?)(?:\s+(?P<target_kind>Action|Copy):\s+(?P<target>\S.*))?$")
+_MAX_NEED, _MAX_WHY, _MAX_COPY = 300, 600, 2000
 
 
 def load_app_private_key(raw: str) -> rsa.RSAPrivateKey:
@@ -117,7 +143,7 @@ def _b64url(data: bytes) -> str:
 
 
 class GitHubWaitingSource:
-    """Fetch open, non-draft pull requests for one owner through a read-only App.
+    """Build Joe's inbox for one owner from GitHub, through a read-only App.
 
     ```python
     source = GitHubWaitingSource(
@@ -125,7 +151,7 @@ class GitHubWaitingSource:
         private_key=os.environ["DASHBOARD_GH_APP_KEY"],
         transport=AiohttpJsonTransport(10),
     )
-    items = await source.fetch()
+    inbox = await source.fetch()
     ```
     """
 
@@ -151,16 +177,31 @@ class GitHubWaitingSource:
         self._token: str | None = None
         self._token_expires_at = 0.0
 
-    async def fetch(self) -> list[WaitingItem]:
-        search = f"is:pr is:open draft:false archived:false user:{self.owner} sort:updated-desc"
-        data = await self.graphql(WAITING_QUERY, {"search": search})
-        nodes = data.get("search", {}).get("nodes", []) if isinstance(data, dict) else []
-        items = (waiting_item_from_node(node, self.owner) for node in nodes if isinstance(node, dict))
-        return [item for item in items if item is not None]
+    async def fetch(self) -> Inbox:
+        merged_since = datetime.fromtimestamp(self._clock(), timezone.utc) - timedelta(days=MERGED_WINDOW_DAYS)
+        variables = {
+            "open": f"is:open archived:false user:{self.owner} sort:updated-desc",
+            "merged": (
+                f"is:pr is:merged archived:false user:{self.owner} "
+                f"merged:>={merged_since.date().isoformat()} sort:updated-desc"
+            ),
+        }
+        data = await self.graphql(INBOX_QUERY, variables)
+        items: list[InboxItem] = []
+        rejected: list[RejectedAsk] = []
+        for key in ("open", "merged"):
+            search = data.get(key) if isinstance(data, dict) else None
+            nodes = search.get("nodes", []) if isinstance(search, dict) else []
+            for node in nodes:
+                if isinstance(node, dict):
+                    found, refused = inbox_from_node(node, self.owner)
+                    items.extend(found)
+                    rejected.extend(refused)
+        return Inbox(items, rejected)
 
     async def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         if _MUTATION.match(query):
-            raise ValueError("The waiting dashboard only sends GraphQL queries")
+            raise ValueError("The waiting inbox only sends GraphQL queries")
         token = await self._installation_token()
         response = await self._request(
             "POST",
@@ -213,7 +254,7 @@ class GitHubWaitingSource:
         )
         if writable:
             raise WaitingSourceError(
-                "The dashboard only runs with a read-only GitHub App, and this App can write "
+                "The inbox only runs with a read-only GitHub App, and this App can write "
                 f"({', '.join(writable)})."
             )
         self._token = token
@@ -230,7 +271,7 @@ class GitHubWaitingSource:
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "homelab-functions-waiting-dashboard",
+            "User-Agent": "homelab-functions-waiting-inbox",
             **auth,
         }
         try:
@@ -253,77 +294,180 @@ def _parse_expiry(value: Any, *, fallback: float) -> float:
         return fallback
 
 
-def waiting_item_from_node(node: dict[str, Any], owner: str) -> WaitingItem | None:
-    """Parse one GraphQL pull request node. Returns None for anything malformed."""
+def inbox_from_node(node: dict[str, Any], owner: str) -> tuple[list[InboxItem], list[RejectedAsk]]:
+    """Turn one GraphQL pull request or issue node into inbox items.
 
+    Anything malformed, from another owner, or not on github.com yields nothing.
+    """
+
+    kind = node.get("__typename")
     repo = (node.get("repository") or {}).get("nameWithOwner")
     number = node.get("number")
     url = node.get("url")
-    title = node.get("title")
-    if not (isinstance(repo, str) and isinstance(number, int) and isinstance(url, str) and isinstance(title, str)):
-        return None
+    if kind not in ("PullRequest", "Issue"):
+        return [], []
+    if not (isinstance(repo, str) and isinstance(number, int) and isinstance(url, str)):
+        return [], []
     if repo.split("/", 1)[0].lower() != owner.lower():
-        return None
-    if url != f"https://github.com/{repo}/pull/{number}":
-        return None
-    rollup = _rollup(node)
-    checks = _checks_state(rollup.get("state"))
-    failing = _failing_checks(rollup)
-    if checks == "failing":
-        state = ItemState.FAILING
-    elif checks == "running":
-        state = ItemState.RUNNING
-    elif node.get("reviewDecision") == "CHANGES_REQUESTED":
-        state = ItemState.CHANGES_REQUESTED
-    else:
-        state = ItemState.READY
-    author = (node.get("author") or {}).get("login")
-    return WaitingItem(
-        repo=repo,
-        number=number,
-        title=title,
-        url=url,
-        author=author if isinstance(author, str) else "ghost",
-        state=state,
-        checks=checks,
-        failing_checks=failing,
-        created_at=str(node.get("createdAt") or ""),
-        updated_at=str(node.get("updatedAt") or ""),
-        head_ref=str(node.get("headRefName") or ""),
-        cross_repository=bool(node.get("isCrossRepository")),
-    )
+        return [], []
+    path = "pull" if kind == "PullRequest" else "issues"
+    if url != f"https://github.com/{repo}/{path}/{number}":
+        return [], []
+    state = node.get("state")
+    if state not in ("OPEN", "MERGED"):
+        return [], []
+
+    is_open_pr = kind == "PullRequest" and state == "OPEN"
+    cross = bool(node.get("isCrossRepository"))
+    head_ref = node.get("headRefName") if is_open_pr and not cross else None
+    context = {
+        "repo": repo,
+        "number": number,
+        "head_ref": head_ref if isinstance(head_ref, str) and head_ref else None,
+        "pr_url": url if is_open_pr and cross else None,
+    }
+    label = f"{repo}#{number}"
+    updated_at = str(node.get("updatedAt") or "")
+    items: list[InboxItem] = []
+    rejected: list[RejectedAsk] = []
+
+    if is_open_pr:
+        merge = approve_merge_item(node, label=label, updated_at=updated_at, **context)
+        if merge is not None:
+            items.append(merge)
+
+    sources = [(node.get("body"), url, label, updated_at)]
+    for comment in ((node.get("comments") or {}).get("nodes") or []):
+        if isinstance(comment, dict) and str(comment.get("url") or "").startswith(f"{url}#"):
+            sources.append((comment.get("body"), comment["url"], f"{label} comment", str(comment.get("updatedAt") or updated_at)))
+    for text, source_url, source_label, source_updated in sources:
+        if isinstance(text, str):
+            found, refused = parse_asks(
+                text,
+                source_url=source_url,
+                source_label=source_label,
+                updated_at=source_updated,
+                **context,
+            )
+            items.extend(found)
+            rejected.extend(refused)
+    return items, rejected
 
 
-def _rollup(node: dict[str, Any]) -> dict[str, Any]:
+def approve_merge_item(
+    node: dict[str, Any],
+    *,
+    repo: str,
+    number: int,
+    label: str,
+    updated_at: str,
+    head_ref: str | None,
+    pr_url: str | None,
+) -> InboxItem | None:
+    """Return the approve/merge item when nothing but Joe blocks the pull request."""
+
+    if node.get("isDraft") or node.get("reviewDecision") == "CHANGES_REQUESTED":
+        return None
+    if node.get("mergeable") == "CONFLICTING":
+        return None
     commits = (node.get("commits") or {}).get("nodes") or []
     commit = (commits[-1] or {}).get("commit") if commits else None
     rollup = (commit or {}).get("statusCheckRollup")
-    return rollup if isinstance(rollup, dict) else {}
+    checks = rollup.get("state") if isinstance(rollup, dict) else None
+    if checks not in ("SUCCESS", None):
+        return None
+    if node.get("reviewDecision") == "APPROVED":
+        why = "It is approved and its checks passed. It only needs merging."
+    elif checks == "SUCCESS":
+        why = "Its checks passed and nothing else blocks it."
+    else:
+        why = "It has no checks and nothing else blocks it."
+    title = str(node.get("title") or "").strip() or label
+    url = node["url"]
+    return InboxItem(
+        id=f"{repo}#{number}:{Category.APPROVE_MERGE.value}",
+        category=Category.APPROVE_MERGE,
+        need=f"Approve and merge “{title}”",
+        why=why,
+        action=PrimaryAction("open", ACTION_LABELS[Category.APPROVE_MERGE], url=url),
+        source_url=url,
+        source_label=label,
+        repo=repo,
+        updated_at=updated_at,
+        head_ref=head_ref,
+        pr_url=pr_url,
+    )
 
 
-def _checks_state(rollup_state: Any) -> str:
-    if rollup_state == "SUCCESS":
-        return "passed"
-    if rollup_state in ("FAILURE", "ERROR"):
-        return "failing"
-    if rollup_state in ("PENDING", "EXPECTED"):
-        return "running"
-    return "none"
+def parse_asks(
+    text: str,
+    *,
+    repo: str,
+    number: int,
+    source_url: str,
+    source_label: str,
+    updated_at: str,
+    head_ref: str | None,
+    pr_url: str | None,
+) -> tuple[list[InboxItem], list[RejectedAsk]]:
+    """Read the unchecked `**Joe: kind**` task-list lines in one body or comment."""
 
-
-def _failing_checks(rollup: dict[str, Any]) -> tuple[FailingCheck, ...]:
-    contexts = (rollup.get("contexts") or {}).get("nodes") or []
-    failing: list[FailingCheck] = []
-    for context in contexts:
-        if not isinstance(context, dict):
+    items: list[InboxItem] = []
+    rejected: list[RejectedAsk] = []
+    for line in text.splitlines():
+        match = _ASK_LINE.match(line)
+        if match is None or match["mark"] != " ":
             continue
-        if context.get("__typename") == "CheckRun" and context.get("conclusion") in _FAILED_CONCLUSIONS:
-            name, url = context.get("name"), context.get("detailsUrl")
-        elif context.get("__typename") == "StatusContext" and context.get("state") in _FAILED_STATUSES:
-            name, url = context.get("context"), context.get("targetUrl")
+
+        def refuse(reason: str) -> None:
+            rejected.append(RejectedAsk(source_url, line.strip()[:200], reason))
+
+        category = ASK_KINDS.get(match["kind"].strip().lower())
+        if category is None:
+            refuse(f"Unknown kind {match['kind'].strip()!r}. Use one of: {', '.join(sorted(ASK_KINDS))}.")
+            continue
+        need, separator, tail = match["rest"].partition(" Why: ")
+        need = need.strip()
+        tail_match = _ASK_TAIL.match(tail.strip()) if separator else None
+        if not need or tail_match is None:
+            refuse("An ask needs what is needed, then ' Why: ' and the reason.")
+            continue
+        why = tail_match["why"].strip()
+        why = why[:1].upper() + why[1:]
+        target_kind, target = tail_match["target_kind"], (tail_match["target"] or "").strip()
+        if len(need) > _MAX_NEED or len(why) > _MAX_WHY:
+            refuse(f"Keep the need under {_MAX_NEED} characters and the reason under {_MAX_WHY}.")
+            continue
+        if category is Category.COPY:
+            value = target.strip("`").strip() if target_kind == "Copy" else ""
+            if not value or len(value) > _MAX_COPY:
+                refuse("A copy ask ends with ' Copy: `the value`'.")
+                continue
+            action = PrimaryAction("copy", ACTION_LABELS[Category.COPY], value=value)
+        elif target_kind == "Action":
+            if not re.fullmatch(r"https://\S+", target):
+                refuse("Action must be one https URL.")
+                continue
+            action = PrimaryAction("open", ACTION_LABELS[category], url=target)
+        elif target_kind == "Copy":
+            refuse("Only copy asks take a Copy value. Use Action: with a URL instead.")
+            continue
         else:
-            continue
-        if isinstance(name, str) and name:
-            safe_url = url if isinstance(url, str) and url.startswith("https://") else None
-            failing.append(FailingCheck(name, safe_url))
-    return tuple(failing[:5])
+            action = PrimaryAction("open", ACTION_LABELS[category], url=source_url)
+        digest = hashlib.sha1(" ".join(need.lower().split()).encode()).hexdigest()[:10]
+        items.append(
+            InboxItem(
+                id=f"{repo}#{number}:{category.value}:{digest}",
+                category=category,
+                need=need,
+                why=why,
+                action=action,
+                source_url=source_url,
+                source_label=source_label,
+                repo=repo,
+                updated_at=updated_at,
+                head_ref=head_ref,
+                pr_url=pr_url,
+            )
+        )
+    return items, rejected

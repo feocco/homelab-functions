@@ -1,8 +1,8 @@
 """Cursor Cloud Agents API client for Waiting on me feedback.
 
-Only three calls are made: launch an agent, send it a follow-up, and read the
-pull request it opened. The launch body is built from a fixed field list, so
-this client cannot ask Cursor to merge, approve, or deploy.
+Only two calls are made: launch an agent and send it a follow-up. The launch
+body is built from a fixed field list, so this client cannot ask Cursor to
+merge, approve, or deploy.
 """
 
 from __future__ import annotations
@@ -12,22 +12,25 @@ from typing import Any
 from urllib.parse import quote
 
 from .json_http import JsonResponse, JsonTransport, TransportError
-from .waiting import CursorCallError, WaitingItem
+from .waiting import CursorCallError, InboxItem
 
 
 CURSOR_API_URL = "https://api.cursor.com"
 LAUNCH_FIELDS = frozenset({"agentId", "name", "prompt", "repos", "autoCreatePR", "workOnCurrentBranch"})
 _AGENT_URL_PREFIX = "https://cursor.com/"
-_PR_URL_PREFIX = "https://github.com/"
 
 
-def launch_body(*, agent_id: str, name: str, prompt: str, item: WaitingItem) -> dict[str, Any]:
-    """Return the `POST /v1/agents` body for one item's feedback agent."""
+def launch_body(*, agent_id: str, name: str, prompt: str, item: InboxItem) -> dict[str, Any]:
+    """Return the `POST /v1/agents` body for one item's feedback agent.
+
+    The agent starts from the item's open pull request branch, from the pull
+    request itself when it comes from a fork, or else from the default branch.
+    """
 
     repo: dict[str, str] = {"url": f"https://github.com/{item.repo}"}
-    if item.cross_repository:
-        repo["prUrl"] = item.url
-    else:
+    if item.pr_url:
+        repo["prUrl"] = item.pr_url
+    elif item.head_ref:
         repo["startingRef"] = item.head_ref
     body = {
         "agentId": agent_id,
@@ -64,7 +67,7 @@ class CursorAgentsClient:
         self._transport = transport
         self._base_url = base_url.rstrip("/")
 
-    async def launch(self, *, agent_id: str, name: str, prompt: str, item: WaitingItem) -> str:
+    async def launch(self, *, agent_id: str, name: str, prompt: str, item: InboxItem) -> str:
         body = launch_body(agent_id=agent_id, name=name, prompt=prompt, item=item)
         response = await self._call("POST", "/v1/agents", body)
         agent = response.body.get("agent") if isinstance(response.body, dict) else None
@@ -91,21 +94,6 @@ class CursorAgentsClient:
                 raise
             raise busy from exc
         return "steer"
-
-    async def pull_request_url(self, agent_id: str) -> str | None:
-        agent_path = f"/v1/agents/{quote(agent_id, safe='')}"
-        agent = (await self._call("GET", agent_path)).body
-        run_id = agent.get("latestRunId") if isinstance(agent, dict) else None
-        if not isinstance(run_id, str) or not run_id:
-            return None
-        run = (await self._call("GET", f"{agent_path}/runs/{quote(run_id, safe='')}")).body
-        git = run.get("git") if isinstance(run, dict) else None
-        branches = git.get("branches") if isinstance(git, dict) else None
-        for branch in branches if isinstance(branches, list) else []:
-            pr_url = branch.get("prUrl") if isinstance(branch, dict) else None
-            if isinstance(pr_url, str) and pr_url.startswith(_PR_URL_PREFIX):
-                return pr_url
-        return None
 
     async def _call(self, method: str, path: str, payload: Any | None = None) -> JsonResponse:
         headers = dict(self._headers)

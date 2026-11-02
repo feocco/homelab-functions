@@ -406,10 +406,11 @@ ACCESS_VECTOR = AccessVector(
             operation_id="get_waiting_items",
             method="GET",
             path="/v1/waiting",
-            summary="Return the Waiting on me snapshot",
+            summary="Return Joe's Waiting on me inbox",
             description=(
-                "Return the open pull requests waiting on Joe, with check state and feedback agents. "
-                "This is the same snapshot document the dashboard page and its SSE stream publish."
+                "Return only the items that need Joe, in seven categories, each with what is needed, why, "
+                "one primary action, and a source link. This is the same snapshot document the inbox page "
+                "and its SSE stream publish."
             ),
             domain="Waiting on me",
             parameters=(),
@@ -419,9 +420,9 @@ ACCESS_VECTOR = AccessVector(
             operation_id="send_waiting_feedback",
             method="POST",
             path="/v1/waiting/feedback",
-            summary="Send feedback on a waiting item to its Cursor agent",
+            summary="Send feedback on an inbox item to its Cursor agent",
             description=(
-                "Send feedback on one waiting item. The first feedback launches one Cursor agent that "
+                "Send feedback on one inbox item. The first feedback launches one Cursor agent that "
                 "opens one pull request; later feedback goes to that same agent. Reuse request_id to "
                 "retry safely. Feedback never approves, merges, or deploys anything."
             ),
@@ -433,7 +434,7 @@ ACCESS_VECTOR = AccessVector(
             ),
             errors=_documented_errors(
                 AccessError("400", "Invalid request"),
-                AccessError("404", "No waiting item has that id"),
+                AccessError("404", "No inbox item has that id"),
                 AccessError("409", "request_id reused for other feedback, or the agent is busy"),
                 AccessError("502", "Cursor rejected the request"),
                 AccessError("503", "Feedback is off because CURSOR_API_KEY is not set"),
@@ -619,7 +620,7 @@ _assert_http_only_disjoint()
 
 @dataclass(frozen=True)
 class DashboardRoute:
-    """A browser route of the Waiting on me dashboard.
+    """A browser route of the Waiting on me inbox.
 
     These routes use a signed session cookie, never a bearer token, and stay
     outside `/v1` and `ACCESS_VECTOR`. Agents read and send the same data with
@@ -639,8 +640,8 @@ class DashboardRoute:
 
 
 DASHBOARD_ROUTES: tuple[DashboardRoute, ...] = (
-    DashboardRoute("GET", "/", "Redirect the dashboard hostname to /waiting.", "none"),
-    DashboardRoute("GET", "/waiting", "Dashboard page. Shows the sign-in form without a session.", "session"),
+    DashboardRoute("GET", "/", "Redirect the inbox hostname to /waiting.", "none"),
+    DashboardRoute("GET", "/waiting", "Inbox page. Shows the sign-in form without a session.", "session"),
     DashboardRoute(
         "POST",
         "/waiting/session",
@@ -651,6 +652,7 @@ DASHBOARD_ROUTES: tuple[DashboardRoute, ...] = (
     DashboardRoute("GET", "/waiting/events", "Server-sent events: the snapshot now and after every change.", "session"),
     DashboardRoute("GET", "/waiting/snapshot", "The same snapshot as JSON, for the polling fallback.", "session"),
     DashboardRoute("POST", "/waiting/feedback", "Send feedback on one item. Same body as send_waiting_feedback.", "session"),
+    DashboardRoute("POST", "/waiting/handled", "Joe marks one item done. Not for approve/merge items.", "session"),
 )
 
 

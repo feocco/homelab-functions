@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from homelab.github_waiting import WAITING_QUERY, GitHubWaitingSource, load_app_private_key
+from homelab.github_waiting import INBOX_QUERY, GitHubWaitingSource, load_app_private_key
 from homelab.json_http import JsonResponse
-from homelab.waiting import ItemState, WaitingSourceError
+from homelab.waiting import Category, WaitingSourceError
 from waiting_support import FakeTransport, raise_transport
 
 
@@ -19,30 +19,44 @@ PEM = KEY.private_bytes(
     serialization.NoEncryption(),
 ).decode()
 NOW = 1_800_000_000.0
-READ_ONLY = {"metadata": "read", "pull_requests": "read", "checks": "read", "statuses": "read"}
+READ_ONLY = {"metadata": "read", "pull_requests": "read", "issues": "read", "checks": "read"}
+REPO = "feocco/homelab-functions"
 
 
-def pr_node(number, *, repo="feocco/homelab-functions", rollup="SUCCESS", contexts=(), review=None, **extra):
+def pr_node(
+    number,
+    *,
+    repo=REPO,
+    state="OPEN",
+    checks="SUCCESS",
+    review=None,
+    draft=False,
+    mergeable="MERGEABLE",
+    body="",
+    comments=(),
+    cross=False,
+    **extra,
+):
+    url = f"https://github.com/{repo}/pull/{number}"
     node = {
+        "__typename": "PullRequest",
         "number": number,
         "title": f"Fake PR {number}",
-        "url": f"https://github.com/{repo}/pull/{number}",
-        "createdAt": "2026-11-01T10:00:00Z",
+        "url": url,
+        "body": body,
         "updatedAt": f"2026-11-01T1{number % 10}:00:00Z",
+        "state": state,
+        "isDraft": draft,
         "headRefName": f"cursor/fake-{number}",
-        "isCrossRepository": False,
+        "isCrossRepository": cross,
         "reviewDecision": review,
-        "author": {"login": "cursor"},
+        "mergeable": mergeable,
         "repository": {"nameWithOwner": repo},
-        "commits": {
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": checks} if checks else None}}]},
+        "comments": {
             "nodes": [
-                {
-                    "commit": {
-                        "statusCheckRollup": None
-                        if rollup is None
-                        else {"state": rollup, "contexts": {"nodes": list(contexts)}}
-                    }
-                }
+                {"body": text, "url": f"{url}#issuecomment-{index}", "updatedAt": "2026-11-01T18:00:00Z"}
+                for index, text in enumerate(comments)
             ]
         },
     }
@@ -50,7 +64,21 @@ def pr_node(number, *, repo="feocco/homelab-functions", rollup="SUCCESS", contex
     return node
 
 
-def github(transport, *, permissions=READ_ONLY, nodes=(), token_status=201, expires_at="2027-01-15T08:00:00Z"):
+def issue_node(number, *, repo=REPO, body=""):
+    return {
+        "__typename": "Issue",
+        "number": number,
+        "title": f"Fake issue {number}",
+        "url": f"https://github.com/{repo}/issues/{number}",
+        "body": body,
+        "updatedAt": "2026-11-01T09:00:00Z",
+        "state": "OPEN",
+        "repository": {"nameWithOwner": repo},
+        "comments": {"nodes": []},
+    }
+
+
+def github(transport, *, permissions=READ_ONLY, open_nodes=(), merged_nodes=(), token_status=201, expires_at="2027-01-15T08:00:00Z"):
     transport.on(
         lambda r: r.url.endswith("/access_tokens"),
         lambda r: JsonResponse(
@@ -62,7 +90,10 @@ def github(transport, *, permissions=READ_ONLY, nodes=(), token_status=201, expi
     )
     transport.on(
         lambda r: r.url.endswith("/graphql"),
-        lambda r: JsonResponse(200, {"data": {"search": {"nodes": list(nodes)}}}),
+        lambda r: JsonResponse(
+            200,
+            {"data": {"open": {"nodes": list(open_nodes)}, "merged": {"nodes": list(merged_nodes)}}},
+        ),
     )
 
 
@@ -81,13 +112,17 @@ def decode_segment(segment):
     return json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
 
 
-class GitHubAppAuthTests(unittest.IsolatedAsyncioTestCase):
-    async def test_signs_an_app_jwt_and_uses_the_installation_token(self):
-        transport = FakeTransport()
-        github(transport, nodes=[pr_node(14)])
-        items = await source(transport).fetch()
+def ask(kind, need, why, tail="", mark=" "):
+    return f"- [{mark}] **Joe: {kind}** {need} Why: {why}{tail}"
 
-        self.assertEqual([item.id for item in items], ["feocco/homelab-functions#14"])
+
+class GitHubAppAuthTests(unittest.IsolatedAsyncioTestCase):
+    async def test_signs_an_app_jwt_and_queries_open_and_recently_merged_sources(self):
+        transport = FakeTransport()
+        github(transport, open_nodes=[pr_node(14)])
+        inbox = await source(transport).fetch()
+
+        self.assertEqual([item.id for item in inbox.items], [f"{REPO}#14:approve_merge"])
         token_request, graphql_request = transport.requests
         self.assertEqual(token_request.method, "POST")
         self.assertEqual(token_request.url, "https://api.github.com/app/installations/177648549/access_tokens")
@@ -102,10 +137,14 @@ class GitHubAppAuthTests(unittest.IsolatedAsyncioTestCase):
             hashes.SHA256(),
         )
         self.assertEqual(graphql_request.headers["Authorization"], "Bearer ghs_fake_installation_token")
-        self.assertEqual(graphql_request.payload["query"], WAITING_QUERY)
+        self.assertEqual(graphql_request.payload["query"], INBOX_QUERY)
+        merged_since = datetime.fromtimestamp(NOW - 14 * 86400, timezone.utc).date().isoformat()
         self.assertEqual(
             graphql_request.payload["variables"],
-            {"search": "is:pr is:open draft:false archived:false user:feocco sort:updated-desc"},
+            {
+                "open": "is:open archived:false user:feocco sort:updated-desc",
+                "merged": f"is:pr is:merged archived:false user:feocco merged:>={merged_since} sort:updated-desc",
+            },
         )
 
     async def test_reuses_the_token_until_five_minutes_before_expiry(self):
@@ -160,6 +199,17 @@ class GitHubAppAuthTests(unittest.IsolatedAsyncioTestCase):
             await source(transport).graphql("  mutation { mergePullRequest(input: {}) { clientMutationId } }", {})
         self.assertEqual(transport.requests, [])
 
+    async def test_graphql_errors_surface_as_source_errors(self):
+        transport = FakeTransport()
+        github(transport)
+        transport.handlers[1] = (
+            transport.handlers[1][0],
+            lambda r: JsonResponse(200, {"errors": [{"message": "Something went wrong"}]}),
+        )
+        with self.assertRaises(WaitingSourceError) as caught:
+            await source(transport).fetch()
+        self.assertIn("Something went wrong", str(caught.exception))
+
 
 class PrivateKeyFormatTests(unittest.TestCase):
     def test_accepts_pem_escaped_pem_and_base64_pem(self):
@@ -181,63 +231,142 @@ class PrivateKeyFormatTests(unittest.TestCase):
         self.assertNotIn("not-a-key-value", str(caught.exception))
 
 
-class AggregationTests(unittest.IsolatedAsyncioTestCase):
-    async def fetch(self, nodes):
+class InboxTests(unittest.IsolatedAsyncioTestCase):
+    async def fetch(self, open_nodes=(), merged_nodes=()):
         transport = FakeTransport()
-        github(transport, nodes=nodes)
+        github(transport, open_nodes=open_nodes, merged_nodes=merged_nodes)
         return await source(transport).fetch()
 
-    async def test_classifies_check_rollups_and_review_state(self):
-        items = await self.fetch(
+    async def test_only_pull_requests_waiting_on_joe_become_approve_merge_items(self):
+        inbox = await self.fetch(
             [
-                pr_node(1, rollup="SUCCESS"),
-                pr_node(
-                    2,
-                    rollup="FAILURE",
-                    contexts=[
-                        {"__typename": "CheckRun", "name": "pytest", "conclusion": "FAILURE", "detailsUrl": "https://github.com/x"},
-                        {"__typename": "CheckRun", "name": "lint", "conclusion": "SUCCESS", "detailsUrl": "https://github.com/y"},
-                        {"__typename": "StatusContext", "context": "ci/legacy", "state": "ERROR", "targetUrl": "javascript:alert(1)"},
-                    ],
-                ),
-                pr_node(3, rollup="PENDING"),
-                pr_node(4, rollup="SUCCESS", review="CHANGES_REQUESTED"),
-                pr_node(5, rollup=None),
+                pr_node(1, checks="SUCCESS"),
+                pr_node(2, checks=None, review="APPROVED"),
+                pr_node(3, checks="FAILURE"),
+                pr_node(4, checks="PENDING"),
+                pr_node(5, draft=True),
+                pr_node(6, review="CHANGES_REQUESTED"),
+                pr_node(7, mergeable="CONFLICTING"),
             ]
         )
-        by_number = {item.number: item for item in items}
-        self.assertEqual(by_number[1].state, ItemState.READY)
-        self.assertEqual(by_number[2].state, ItemState.FAILING)
+        by_number = {item.source_label: item for item in inbox.items}
+        self.assertEqual(sorted(by_number), [f"{REPO}#1", f"{REPO}#2"])
+        for item in inbox.items:
+            self.assertIs(item.category, Category.APPROVE_MERGE)
+            self.assertEqual(item.need, f"Approve and merge “Fake PR {item.source_label[-1]}”")
+            self.assertEqual(item.action.kind, "open")
+            self.assertEqual(item.action.url, item.source_url)
+            self.assertEqual(item.action.label, "Review and merge on GitHub")
+        self.assertEqual(by_number[f"{REPO}#1"].why, "Its checks passed and nothing else blocks it.")
+        self.assertEqual(by_number[f"{REPO}#2"].why, "It is approved and its checks passed. It only needs merging.")
+
+    async def test_ask_lines_become_items_in_their_category(self):
+        body = "\n".join(
+            (
+                "Some context the agent wrote.",
+                ask("deploy", "Roll out the image.", "macmini runs an old build.", " Action: https://github.com/feocco/homelab-config/actions"),
+                ask("secret", "Add `FAKE_KEY`.", "the service cannot start."),
+                ask("key", "Rotate the fake token.", "it leaked in a test log."),
+                ask("dns", "Pick a hostname.", "two services want the same one."),
+                ask("infra", "Approve a bigger disk.", "the volume is 92% full."),
+                ask("question", "Skip Fridays?", "the routine needs one rule."),
+                ask("copy", "Run the apply.", "it publishes the record.", " Copy: `./scripts/apply --watch`"),
+                ask("evidence", "Check the screenshots.", "they prove the layout.", " Action: https://github.com/feocco/x/pull/1#evidence"),
+            )
+        )
+        inbox = await self.fetch([pr_node(9, checks="FAILURE", body=body)])
+        found = {(item.category, item.need): item for item in inbox.items}
         self.assertEqual(
-            [(check.name, check.url) for check in by_number[2].failing_checks],
-            [("pytest", "https://github.com/x"), ("ci/legacy", None)],
+            sorted((category.value, need) for category, need in found),
+            sorted(
+                [
+                    ("deploy", "Roll out the image."),
+                    ("secret", "Add `FAKE_KEY`."),
+                    ("secret", "Rotate the fake token."),
+                    ("infra", "Pick a hostname."),
+                    ("infra", "Approve a bigger disk."),
+                    ("question", "Skip Fridays?"),
+                    ("copy", "Run the apply."),
+                    ("evidence", "Check the screenshots."),
+                ]
+            ),
         )
-        self.assertEqual(by_number[3].state, ItemState.RUNNING)
-        self.assertEqual(by_number[4].state, ItemState.CHANGES_REQUESTED)
-        self.assertEqual((by_number[5].state, by_number[5].checks), (ItemState.READY, "none"))
+        copy = found[(Category.COPY, "Run the apply.")]
+        self.assertEqual((copy.action.kind, copy.action.label, copy.action.value), ("copy", "Copy", "./scripts/apply --watch"))
+        deploy = found[(Category.DEPLOY, "Roll out the image.")]
+        self.assertEqual((deploy.action.label, deploy.action.url), ("Review the deploy", "https://github.com/feocco/homelab-config/actions"))
+        question = found[(Category.QUESTION, "Skip Fridays?")]
+        self.assertEqual((question.action.label, question.action.url), ("Answer on GitHub", question.source_url))
+        self.assertEqual(question.why, "The routine needs one rule.")
+        self.assertTrue(all(item.source_url == f"https://github.com/{REPO}/pull/9" for item in inbox.items))
+        self.assertTrue(all(item.head_ref == "cursor/fake-9" for item in inbox.items))
+        self.assertEqual(inbox.rejected, [])
 
-    async def test_drops_foreign_owners_mismatched_urls_and_non_pr_nodes(self):
-        items = await self.fetch(
+    async def test_checked_or_removed_asks_are_handled(self):
+        open_ask = ask("question", "Skip Fridays?", "the routine needs one rule.")
+        before = await self.fetch([issue_node(3, body=open_ask)])
+        after_tick = await self.fetch([issue_node(3, body=open_ask.replace("[ ]", "[x]"))])
+        after_delete = await self.fetch([issue_node(3, body="Thanks, decided.")])
+        self.assertEqual([item.category for item in before.items], [Category.QUESTION])
+        self.assertEqual(after_tick.items, [])
+        self.assertEqual(after_delete.items, [])
+
+    async def test_item_ids_stay_stable_across_edits_elsewhere(self):
+        line = ask("secret", "Add `FAKE_KEY`.", "the service cannot start.")
+        first = await self.fetch([pr_node(9, checks="FAILURE", body=line)])
+        second = await self.fetch([pr_node(9, checks="FAILURE", body=f"New intro paragraph.\n\n{line}")])
+        self.assertEqual([item.id for item in first.items], [item.id for item in second.items])
+        self.assertRegex(first.items[0].id, rf"^{REPO}#9:secret:[0-9a-f]{{10}}$")
+
+    async def test_comments_issues_and_recently_merged_prs_are_sources(self):
+        comment = ask("evidence", "Check the trace.", "it shows the race.")
+        deploy = ask("deploy", "Roll out the merged image.", "the merge does not deploy it.")
+        inbox = await self.fetch(
+            open_nodes=[pr_node(4, checks="PENDING", comments=(comment,)), issue_node(5, body=ask("question", "Which disk?", "pick one."))],
+            merged_nodes=[pr_node(6, state="MERGED", body=deploy)],
+        )
+        sources = {item.category: (item.source_label, item.source_url, item.head_ref) for item in inbox.items}
+        self.assertEqual(
+            sources[Category.EVIDENCE],
+            (f"{REPO}#4 comment", f"https://github.com/{REPO}/pull/4#issuecomment-0", "cursor/fake-4"),
+        )
+        self.assertEqual(sources[Category.QUESTION], (f"{REPO}#5", f"https://github.com/{REPO}/issues/5", None))
+        self.assertEqual(sources[Category.DEPLOY], (f"{REPO}#6", f"https://github.com/{REPO}/pull/6", None))
+        self.assertNotIn(Category.APPROVE_MERGE, sources)
+
+    async def test_malformed_asks_are_reported_not_shown(self):
+        body = "\n".join(
+            (
+                ask("approve", "Merge this.", "agents cannot ask for merges."),
+                "- [ ] **Joe: secret** Add a key with no reason.",
+                ask("copy", "Run something.", "no value given."),
+                ask("deploy", "Deploy.", "now.", " Action: javascript:alert(1)"),
+                ask("secret", "Add a key.", "because.", " Copy: `SECRET_NAME`"),
+            )
+        )
+        inbox = await self.fetch([pr_node(9, checks="FAILURE", body=body)])
+        self.assertEqual(inbox.items, [])
+        self.assertEqual(len(inbox.rejected), 5)
+        self.assertIn("Unknown kind 'approve'", inbox.rejected[0].reason)
+        self.assertTrue(all(rejected.source_url == f"https://github.com/{REPO}/pull/9" for rejected in inbox.rejected))
+
+    async def test_foreign_owners_mismatched_urls_closed_and_unknown_nodes_yield_nothing(self):
+        line = ask("question", "Hi?", "test.")
+        inbox = await self.fetch(
             [
-                pr_node(1),
-                pr_node(2, repo="someone-else/repo"),
-                pr_node(3, url="https://evil.example/feocco/homelab-functions/pull/3"),
+                pr_node(1, repo="someone-else/repo", body=line),
+                pr_node(2, url="https://evil.example/feocco/homelab-functions/pull/2", body=line),
+                pr_node(3, state="CLOSED", body=line),
+                {"__typename": "Discussion", "body": line},
                 {},
-                {"number": "4"},
             ]
         )
-        self.assertEqual([item.id for item in items], ["feocco/homelab-functions#1"])
+        self.assertEqual((inbox.items, inbox.rejected), ([], []))
 
-    async def test_graphql_errors_surface_as_source_errors(self):
-        transport = FakeTransport()
-        github(transport)
-        transport.handlers[1] = (
-            transport.handlers[1][0],
-            lambda r: JsonResponse(200, {"errors": [{"message": "Something went wrong"}]}),
-        )
-        with self.assertRaises(WaitingSourceError) as caught:
-            await source(transport).fetch()
-        self.assertIn("Something went wrong", str(caught.exception))
+    async def test_fork_prs_point_feedback_at_the_pr_not_a_branch(self):
+        inbox = await self.fetch([pr_node(8, cross=True)])
+        (item,) = inbox.items
+        self.assertEqual((item.head_ref, item.pr_url), (None, f"https://github.com/{REPO}/pull/8"))
 
 
 if __name__ == "__main__":

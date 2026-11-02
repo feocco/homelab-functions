@@ -49,8 +49,8 @@ DOMAIN_SUMMARIES = {
         "Durable “please investigate” records submitted from a notification’s Report button."
     ),
     "Waiting on me": (
-        "Open pull requests waiting on Joe, read through a read-only GitHub App, plus per-item "
-        "feedback that goes to one Cursor agent per item. The dashboard page shows the same snapshot."
+        "Joe's action inbox: only the items that need him, read from GitHub through a read-only App, "
+        "plus per-item feedback that goes to one Cursor agent per item. The inbox page shows the same snapshot."
     ),
 }
 
@@ -71,8 +71,8 @@ EXAMPLE_VALUES: Mapping[str, Any] = {
     "notification_id": 42,
     "workflow": "cat-food-monitor",
     "report_id": 123,
-    "item_id": "feocco/homelab-functions#14",
-    "feedback": "Move the dashboard CSS into its own file.",
+    "item_id": "feocco/homelab-config#41:secret:3f9a1c2b7d",
+    "feedback": "Use the base64 form of the key in the example.",
     "request_id": "feedback-2026-11-01-a1",
 }
 _FALLBACK_BY_TYPE: Mapping[str, Any] = {
@@ -685,11 +685,12 @@ def _dashboard_section() -> str:
 <section id="dashboard">
   <p class="eyebrow">Reference</p>
   <h2>Waiting dashboard</h2>
-  <p class="lead">A browser page at <code>https://waiting.home.feocco.com</code> for the same snapshot that
+  <p class="lead">Joe's action inbox at <code>https://waiting.home.feocco.com</code>, showing the same snapshot that
   {_op_link("get_waiting_items")} returns. It updates over server-sent events and falls back to polling.</p>
   <p>The browser signs in once with <code>HOMELAB_FUNCTIONS_TOKEN</code> and keeps a signed, HttpOnly,
   SameSite=Strict session cookie. That cookie opens only these routes, and the bearer token does not open them.
-  Agents use {_op_link("get_waiting_items")} and {_op_link("send_waiting_feedback")} instead.</p>
+  Agents use {_op_link("get_waiting_items")} and {_op_link("send_waiting_feedback")} instead. Only Joe, signed in,
+  can mark an item done, and approve/merge items clear only when merged or closed on GitHub.</p>
   <div class="table-wrap"><table class="stack">
     <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>Auth</th></tr></thead>
     <tbody>{rows}</tbody>

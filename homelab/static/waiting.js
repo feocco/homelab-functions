@@ -6,18 +6,13 @@
   const STALE_MS = 45000;
   const SSE_RETRY_MS = 60000;
   const NEW_MS = 8000;
+  const LEAVE_MS = 320;
   const MODE_LABELS = {
     connecting: "Connecting",
     live: "Live",
     reconnecting: "Reconnecting",
     polling: "Polling every 30s",
     offline: "Offline",
-  };
-  const CHECK_LABELS = {
-    passed: "Checks passed",
-    failing: "Checks failing",
-    running: "Checks running",
-    none: "No checks",
   };
   const UNITS = [["day", 86400], ["hour", 3600], ["minute", 60], ["second", 1]];
 
@@ -26,6 +21,7 @@
   const updatedEl = $("#updated");
   const sectionsRoot = $("#sections");
   const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   const cards = new Map();
   const sections = new Map();
 
@@ -55,17 +51,38 @@
     return typeof url === "string" && url.startsWith("https://") ? url : null;
   }
 
-  function setLink(link, url, text) {
-    const href = safeHref(url);
-    link.hidden = !href;
-    if (href) link.href = href;
-    if (text !== undefined) link.textContent = text;
+  function withCode(element, text) {
+    const parts = String(text).split("`");
+    element.replaceChildren(
+      ...parts.map((part, index) => {
+        if (index % 2 === 0) return document.createTextNode(part);
+        const code = document.createElement("code");
+        code.textContent = part;
+        return code;
+      }),
+    );
   }
 
   function newRequestId() {
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
     return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function copyText(value) {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return;
+    }
+    const area = document.createElement("textarea");
+    area.value = value;
+    area.setAttribute("readonly", "");
+    area.className = "offscreen";
+    document.body.append(area);
+    area.select();
+    const copied = document.execCommand("copy");
+    area.remove();
+    if (!copied) throw new Error("copy failed");
   }
 
   function setMode(next) {
@@ -83,16 +100,16 @@
 
     const firstRender = seen === null;
     const nextSeen = new Set(next.items.map((item) => item.id));
-    for (const section of next.sections) {
-      const items = next.items.filter((item) => item.state === section.state);
-      const sectionEl = sectionFor(section);
+    for (const category of next.categories) {
+      const items = next.items.filter((item) => item.category === category.id);
+      const sectionEl = sectionFor(category);
       sectionEl.hidden = items.length === 0;
       $(".count", sectionEl).textContent = String(items.length);
       const list = $(".items", sectionEl);
       items.forEach((item, index) => {
         let card = cards.get(item.id);
         if (!card) {
-          card = createCard(item.id);
+          card = createCard(item);
           cards.set(item.id, card);
           if (!firstRender && !seen.has(item.id)) markNew(card);
         }
@@ -102,8 +119,8 @@
     }
     for (const [id, card] of cards) {
       if (!nextSeen.has(id)) {
-        card.remove();
         cards.delete(id);
+        leave(card);
       }
     }
     seen = nextSeen;
@@ -111,17 +128,22 @@
     renderUpdated();
   }
 
+  function leave(card) {
+    if (reduceMotion.matches) {
+      card.remove();
+      return;
+    }
+    card.classList.add("is-leaving");
+    setTimeout(() => card.remove(), LEAVE_MS);
+  }
+
   function renderSummary(next) {
     const total = next.items.length;
-    const repos = new Set(next.items.map((item) => item.repo)).size;
     let text;
     if (total === 0) {
-      text = next.github.status === "ok" ? "All clear." : "No pull requests to show.";
+      text = next.github.status === "ok" ? "Nothing needs you right now." : "No items to show.";
     } else {
-      text = `${total} pull request${total === 1 ? "" : "s"} waiting on you`;
-      if (repos > 1) text += ` across ${repos} repos`;
-      text += ".";
-      if (next.counts.ready) text += ` ${next.counts.ready} ready for review.`;
+      text = `${total} thing${total === 1 ? " needs" : "s need"} you.`;
     }
     $("#summary").textContent = text;
   }
@@ -131,7 +153,7 @@
     const github = next.github;
     if (github.status === "unconfigured") notices.push(["error", github.message]);
     if (github.status === "error") {
-      const stale = github.refreshed_at ? ` Showing data from ${ago(github.refreshed_at)}.` : "";
+      const stale = github.refreshed_at ? ` Showing what was read ${ago(github.refreshed_at)}.` : "";
       notices.push(["error", `GitHub: ${github.message}${stale}`]);
     }
     if (!next.feedback.enabled) notices.push(["info", next.feedback.message]);
@@ -156,19 +178,16 @@
     } else {
       updatedEl.textContent = github.status === "pending" ? "Reading GitHub…" : "Not updated yet";
     }
-    for (const age of sectionsRoot.querySelectorAll(".age")) {
-      age.textContent = `updated ${ago(age.dataset.time)}`;
-    }
   }
 
-  function sectionFor(section) {
-    let sectionEl = sections.get(section.state);
+  function sectionFor(category) {
+    let sectionEl = sections.get(category.id);
     if (!sectionEl) {
       sectionEl = $("#section-template").content.firstElementChild.cloneNode(true);
-      sectionEl.dataset.state = section.state;
-      $(".section-label", sectionEl).textContent = section.label;
+      sectionEl.dataset.category = category.id;
+      $(".section-label", sectionEl).textContent = category.label;
       sectionsRoot.append(sectionEl);
-      sections.set(section.state, sectionEl);
+      sections.set(category.id, sectionEl);
     }
     return sectionEl;
   }
@@ -178,10 +197,12 @@
     setTimeout(() => card.classList.remove("is-new"), NEW_MS);
   }
 
-  function createCard(id) {
+  function createCard(item) {
     const card = $("#item-template").content.firstElementChild.cloneNode(true);
-    card.dataset.id = id;
+    card.dataset.id = item.id;
     const form = $(".feedback-form", card);
+    $(".action-copy", card).addEventListener("click", () => copyAction(card));
+    $(".done", card).addEventListener("click", () => markDone(card));
     $(".feedback-toggle", card).addEventListener("click", () => {
       if (form.hidden) openForm(card);
       else closeForm(card);
@@ -195,59 +216,78 @@
   }
 
   function updateCard(card, item, feedback) {
-    card.dataset.state = item.state;
-    $(".repo", card).textContent = item.repo;
-    $(".number", card).textContent = `#${item.number}`;
-    setLink($(".title", card), item.url, item.title);
-    const openPr = $(".open-pr", card);
-    setLink(openPr, item.url);
-    openPr.setAttribute("aria-label", `Open ${item.id} on GitHub`);
+    card.dataset.category = item.category;
+    card.item = item;
+    withCode($(".need", card), item.need);
+    withCode($(".why", card), item.why);
 
-    const failing = item.checks.failing;
-    $(".checks", card).textContent =
-      item.checks.state === "failing" && failing.length
-        ? `${failing.length} check${failing.length === 1 ? "" : "s"} failing`
-        : CHECK_LABELS[item.checks.state] || "Checks";
-    $(".author", card).textContent = `@${item.author}`;
-    const age = $(".age", card);
-    age.dataset.time = item.updated_at;
-    age.textContent = `updated ${ago(item.updated_at)}`;
-    $(".failing", card).replaceChildren(
-      ...failing.map((check) => {
-        const entry = document.createElement("li");
-        const href = safeHref(check.url);
-        const label = document.createElement(href ? "a" : "span");
-        label.textContent = check.name;
-        if (href) {
-          label.href = href;
-          label.target = "_blank";
-          label.rel = "noopener noreferrer";
-        }
-        entry.append(label);
-        return entry;
-      }),
-    );
+    const source = $(".source", card);
+    source.textContent = item.source.label;
+    source.href = safeHref(item.source.url) || "#";
 
-    const agent = item.feedback;
-    $(".agent", card).hidden = !agent;
-    if (agent) {
-      setLink($(".agent-link", card), agent.agent_url, "Open agent");
-      const prNumber = agent.pr_url ? agent.pr_url.split("/").pop() : "";
-      setLink($(".agent-pr", card), agent.pr_url, `Feedback PR #${prNumber}`);
-      $(".agent-count", card).textContent =
-        agent.state === "launching"
-          ? "Launch not confirmed yet"
-          : `${agent.sent_count} note${agent.sent_count === 1 ? "" : "s"} sent`;
+    const open = $(".action-open", card);
+    const copy = $(".action-copy", card);
+    const copyBox = $(".copy-box", card);
+    const isCopy = item.action.type === "copy";
+    open.hidden = isCopy;
+    copy.hidden = !isCopy;
+    copyBox.hidden = !isCopy;
+    if (isCopy) {
+      $(".copy-value", card).textContent = item.action.value;
+      if (!copy.dataset.copied) copy.textContent = item.action.label;
+      copy.setAttribute("aria-label", `${item.action.label}: ${item.action.value}`);
+    } else {
+      open.textContent = item.action.label;
+      open.href = safeHref(item.action.url) || "#";
     }
 
+    const mergeOnly = item.category === "approve_merge";
+    $(".done", card).hidden = mergeOnly;
+    $(".clears", card).hidden = !mergeOnly;
     const toggle = $(".feedback-toggle", card);
     toggle.disabled = !feedback.enabled;
     toggle.title = feedback.enabled ? "" : feedback.message;
-    toggle.textContent = agent ? "Send more feedback" : "Send feedback";
-    $(".hint", card).textContent = agent
-      ? "Goes to this item's Cursor agent, which updates its one pull request."
-      : "Starts one Cursor agent. It opens one pull request for you to review.";
     if (!feedback.enabled && !$(".feedback-form", card).hidden) closeForm(card);
+  }
+
+  async function copyAction(card) {
+    const button = $(".action-copy", card);
+    try {
+      await copyText(card.item.action.value);
+      button.dataset.copied = "true";
+      button.textContent = "Copied";
+      setTimeout(() => {
+        delete button.dataset.copied;
+        button.textContent = card.item.action.label;
+      }, 2000);
+    } catch (error) {
+      button.textContent = "Copy failed. Select the text above.";
+    }
+  }
+
+  async function markDone(card) {
+    const button = $(".done", card);
+    button.disabled = true;
+    try {
+      const response = await fetch("/waiting/handled", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ item_id: card.dataset.id }),
+      });
+      if (response.status === 401) {
+        location.reload();
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (cards.get(card.dataset.id) === card) {
+        cards.delete(card.dataset.id);
+        leave(card);
+      }
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Done (try again)";
+    }
   }
 
   function openForm(card) {

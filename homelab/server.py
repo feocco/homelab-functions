@@ -700,7 +700,7 @@ def _install_waiting_dashboard(
 
 async def start_waiting_refresh(app: web.Application) -> None:
     app[WAITING_REFRESH_TASK_KEY] = asyncio.create_task(
-        run_refresh_loop(app[BOARD_KEY], app[FEEDBACK_KEY]),
+        run_refresh_loop(app[BOARD_KEY]),
         name="homelab-waiting-refresh",
     )
 
