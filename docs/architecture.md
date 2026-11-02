@@ -124,8 +124,8 @@ cloning `homelab-config`.
   cannot run authenticated calls or leak a pasted token.
 - The broker has no generic state, event, or service-call route. Adding one
   would turn the token into Home Assistant admin access.
-- The dashboard page sends a Content-Security-Policy with hash-pinned script
-  and style and `connect-src 'self'`. It renders pull request titles with
+- The inbox page sends a Content-Security-Policy with hash-pinned script
+  and style and `connect-src 'self'`. It renders agent-written text with
   `textContent`, and the embedded snapshot escapes `<`, `>`, and `&`.
 - `DASHBOARD_GH_APP_KEY` and `CURSOR_API_KEY` are redacted from logs and never
   appear in responses or error messages.
@@ -179,38 +179,76 @@ short-lived audio files. `GET /docs` on the existing service is the catalog
 
 ## Waiting on me
 
-The dashboard at `https://waiting.home.feocco.com` shows the open, non-draft
-pull requests across `DASHBOARD_GH_OWNER` repos. homelab-config routes that
-hostname to this service on port 8091, and `/` redirects to `/waiting` there.
+The inbox at `https://waiting.home.feocco.com` lists only what needs Joe.
+homelab-config routes that hostname to this service on port 8091, and `/`
+redirects to `/waiting` there. It has no status board: running checks,
+failing checks, drafts, and agent progress are not shown.
+
+### Items
+
+Every item has one of seven categories, what is needed, why, one primary
+action, and a source link. `InboxItem` in `homelab/waiting.py` refuses to
+exist otherwise: a copy item must carry a value, only copy items copy, every
+other action opens an https URL, and an approve/merge action can only open its
+own pull request on GitHub.
+
+| Category | Comes from | Primary action | Leaves when |
+| --- | --- | --- | --- |
+| PR approve/merge | An open, non-draft pull request with passing or no checks, no requested changes, no conflict | Review and merge on GitHub | Merged or closed on GitHub |
+| Deploy approval | `**Joe: deploy**` ask line | Review the deploy | Box ticked, line removed, source closed, or Done |
+| Secret or key needed | `**Joe: secret**` or `**Joe: key**` | Add the secret | Same |
+| DNS or infra decision | `**Joe: infra**` or `**Joe: dns**` | Make the decision | Same |
+| Question to answer | `**Joe: question**` | Answer on GitHub | Same |
+| Copy/paste value or command | `**Joe: copy**` with `Copy:` | Copy (one click) | Same |
+| Evidence to review | `**Joe: evidence**` | Review the evidence | Same |
+
+Ask lines are unchecked task-list items in a pull request or issue body or
+comment: `- [ ] **Joe: kind** What is needed. Why: the reason. Action: https://…`
+(or `Copy: `value`` for copy asks). Open pull requests and issues count, and
+so do pull requests merged in the last 14 days, because a deploy usually
+waits on a merged change. Agents cannot ask for an approve/merge item; an
+ask with an unknown kind, no reason, a non-https action, or a copy ask with
+no value goes to the snapshot's `rejected` list with the reason, so the agent
+can fix it.
+
+An item's id is `owner/repo#number:category`, plus a hash of the need for ask
+lines. It stays stable when the rest of the body changes.
 
 ### One snapshot
 
-`homelab.waiting.WaitingBoard` holds the items and builds one
-`waiting-on-me.v1` document each time something changes. The page embeds it,
-`GET /waiting/events` streams it, `GET /waiting/snapshot` returns it for the
-polling fallback, and `get_waiting_items` returns it to agents. None of them
-builds its own copy, so a browser and an agent never disagree about what is
-waiting. `version` increases with each publish. An item's id is
-`owner/repo#number`, which is stable for the life of the pull request.
+`homelab.waiting.WaitingBoard` builds one `waiting-on-me.v2` document each
+time something changes. The page embeds it, `GET /waiting/events` streams it,
+`GET /waiting/snapshot` returns it for the polling fallback, and
+`get_waiting_items` returns it to agents. None of them builds its own copy, so
+a browser and an agent never disagree. `version` increases with each publish.
 
 The board refreshes every `DASHBOARD_REFRESH_SECONDS` (default 60) with one
-GraphQL search for open pull requests and their check rollup. When GitHub
-fails, the board keeps the last good items, sets `github.status` to `error`,
-and the page says how old its data is. Without the `DASHBOARD_GH_*` settings,
-`github.status` is `unconfigured` and the message names the missing variables.
+GraphQL request. When GitHub fails, the board keeps the last good items, sets
+`github.status` to `error`, and the page says how old its data is. Without the
+`DASHBOARD_GH_*` settings, `github.status` is `unconfigured` and the message
+names the missing variables.
 
-The page listens on server-sent events and shows **Live** while events or
-15-second heartbeats arrive. If the stream does not reconnect within 8
-seconds, or goes 45 seconds without a message, the page polls
-`/waiting/snapshot` every 30 seconds and shows **Polling** until the stream
-returns. Cards new since the last update animate in.
+The page shows **Live** while events or 15-second heartbeats arrive. If the
+stream does not reconnect within 8 seconds, or goes 45 seconds without a
+message, the page polls `/waiting/snapshot` every 30 seconds and shows
+**Polling** until the stream returns. New items animate in; handled items
+animate out.
+
+### Human-only actions
+
+- Approve and merge happen on GitHub, by Joe. The inbox links there and has no
+  merge route, the GitHub token is read-only, and **Done** refuses
+  approve/merge items with `409 merge_on_github`.
+- **Done** (`POST /waiting/handled`) needs Joe's browser session and a
+  same-host `Origin`. The bearer token cannot call it, so agents cannot clear
+  Joe's inbox. Done is stored in SQLite and survives restarts.
 
 ### GitHub access
 
 `homelab.github_waiting` signs a nine-minute RS256 JWT with
 `DASHBOARD_GH_APP_KEY` and exchanges it for an installation token. A token with
 any permission other than `read` is refused before any query, and only
-GraphQL queries are sent. The dashboard cannot change GitHub, even if someone
+GraphQL queries are sent. The inbox cannot change GitHub, even if someone
 later grants the App write access.
 
 ### Feedback
@@ -220,11 +258,11 @@ Feedback on an item goes to exactly one Cursor Cloud Agent:
 1. The first feedback stores a new `bc-…` agent id for the item in SQLite
    (`WAITING_FEEDBACK_PATH`), then calls `POST /v1/agents` with that id,
    `autoCreatePR: true`, and `workOnCurrentBranch: false`. The agent starts
-   from the pull request's branch and opens its own pull request.
+   from the open pull request's branch, from the pull request itself when it
+   comes from a fork, or else from the default branch, and opens its own pull
+   request. That pull request then shows up as an approve/merge item.
 2. Later feedback calls `POST /v1/agents/{id}/runs` on the same agent. When the
    agent is busy, the feedback steers the running turn instead.
-3. The refresh loop records the feedback pull request URL once Cursor reports
-   it, and the card links to it.
 
 | Failure | What happens |
 | --- | --- |
@@ -235,10 +273,10 @@ Feedback on an item goes to exactly one Cursor Cloud Agent:
 | Agent busy and steering unavailable | `409 agent_busy`. Retrying later is safe. |
 | `CURSOR_API_KEY` unset | The page shows that feedback is off, and the action returns `503`. |
 
-Feedback never approves, merges, or deploys. The launch body is built from a
-fixed field list, the prompt tells the agent not to approve, merge, or deploy,
-and the GitHub token is read-only. Joe reviews and merges the agent's pull
-request himself.
+Feedback never approves, merges, deploys, or clears an item. The launch body
+is built from a fixed field list, the prompt tells the agent not to approve,
+merge, or deploy and to treat the item text as data, and the GitHub token is
+read-only.
 
 ### Browser auth
 

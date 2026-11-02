@@ -1,7 +1,7 @@
 """Browser routes for the Waiting on me inbox.
 
 The browser signs in once with `HOMELAB_FUNCTIONS_TOKEN` and keeps only an
-HMAC-signed session cookie. That cookie opens the dashboard routes in
+HMAC-signed session cookie. That cookie opens the inbox routes in
 `DASHBOARD_ROUTES` and nothing under `/v1`. Rotating the token ends every
 session.
 """
@@ -105,7 +105,7 @@ async def page(request: web.Request) -> web.Response:
 
 async def sign_in(request: web.Request) -> web.Response:
     if not _same_origin(request):
-        return _json_error(403, "cross_origin", "Sign-in must come from the dashboard page")
+        return _json_error(403, "cross_origin", "Sign-in must come from the inbox page")
     form = await request.post()
     presented = form.get("token")
     settings = request.app[SETTINGS_KEY]
@@ -130,7 +130,7 @@ async def sign_in(request: web.Request) -> web.Response:
 
 async def sign_out(request: web.Request) -> web.Response:
     if not _same_origin(request):
-        return _json_error(403, "cross_origin", "Sign-out must come from the dashboard page")
+        return _json_error(403, "cross_origin", "Sign-out must come from the inbox page")
     response = web.HTTPSeeOther("/waiting")
     response.del_cookie(SESSION_COOKIE, path="/waiting")
     raise response
@@ -182,7 +182,7 @@ async def feedback(request: web.Request) -> web.Response:
     if not _signed_in(request):
         return _unauthorized()
     if not _same_origin(request):
-        return _json_error(403, "cross_origin", "Feedback must come from the dashboard page")
+        return _json_error(403, "cross_origin", "Feedback must come from the inbox page")
     try:
         payload = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -208,7 +208,7 @@ async def handled(request: web.Request) -> web.Response:
 
 
 async def submit_feedback(service: FeedbackService, payload: Any) -> web.Response:
-    """Shared by the dashboard route and `send_waiting_feedback`."""
+    """Shared by the inbox route and `send_waiting_feedback`."""
 
     try:
         item_id, text, request_id = validate_feedback(payload)

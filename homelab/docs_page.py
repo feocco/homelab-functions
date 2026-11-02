@@ -544,7 +544,7 @@ def _nav() -> str:
         "</ul>"
         f'<p class="nav-heading">Reference</p><ul>{reference}'
         '<li><a href="#pebble">Pebble ring</a></li>'
-        '<li><a href="#dashboard">Waiting dashboard</a></li>'
+        '<li><a href="#dashboard">Waiting on me inbox</a></li>'
         '<li><a href="#public">Public endpoints</a></li>'
         '<li><a href="#errors">Errors</a></li>'
         "</ul>"
@@ -684,7 +684,7 @@ def _dashboard_section() -> str:
     return f"""
 <section id="dashboard">
   <p class="eyebrow">Reference</p>
-  <h2>Waiting dashboard</h2>
+  <h2>Waiting on me inbox</h2>
   <p class="lead">Joe's action inbox at <code>https://waiting.home.feocco.com</code>, showing the same snapshot that
   {_op_link("get_waiting_items")} returns. It updates over server-sent events and falls back to polling.</p>
   <p>The browser signs in once with <code>HOMELAB_FUNCTIONS_TOKEN</code> and keeps a signed, HttpOnly,

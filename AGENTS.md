@@ -22,7 +22,7 @@
   `HomelabFunctionsClient` method, an MCP tool, a plugin skill entry, and
   behavior-level coverage in `tests/test_access_vector_parity.py`.
 - `/health`, `/docs`, and `/openapi.json` stay public and outside the registry.
-- The Waiting on me browser routes live in `DASHBOARD_ROUTES`, outside `/v1`,
+- The Waiting on me inbox's browser routes live in `DASHBOARD_ROUTES`, outside `/v1`,
  behind a session cookie. `tests/test_access_vector_parity.py` checks that
  every served route belongs to exactly one of `PUBLIC_ENDPOINTS`,
  `ACCESS_VECTOR`, `HTTP_ONLY_OPERATIONS`, or `DASHBOARD_ROUTES`.
@@ -37,14 +37,28 @@
 - Do not add generic Home Assistant state, event, or service-call operations
   to the registry. Use `homelab.HomeAssistantWebSocketClient` for that work.
 
-## Waiting on Me Dashboard
+## Waiting on Me Inbox
 
+- It is an action inbox, not a status board. List only items that need Joe,
+ in exactly seven categories: PR approve/merge, deploy approval, secret or
+ key needed, DNS or infra decision, question to answer, copy/paste value or
+ command, evidence to review. Do not add progress lanes, check-state views,
+ or agent and task lists.
+- To put something in Joe's inbox, add an unchecked task-list line to the pull
+ request or issue body or a comment: `- [ ] **Joe: secret** What is needed.
+ Why: the reason. Action: https://…`. Kinds: `deploy`, `secret`/`key`,
+ `infra`/`dns`, `question`, `copy` (needs `Copy: `value``), `evidence`. Never
+ ask for approve/merge; it comes from GitHub state only. After writing a line,
+ check `get_waiting_items()["rejected"]` for your source URL.
 - Browser: `https://waiting.home.feocco.com` (`/waiting`). Agents:
  `get_waiting_items` and `send_waiting_feedback`, which are normal registry
  actions with a client method, MCP tool, and skill entry.
 - `WaitingBoard.payload()` in `homelab/waiting.py` is the only snapshot
  builder. The page, SSE stream, polling fallback, and `GET /v1/waiting` all
  serve it. Do not add a second serializer.
+- `InboxItem` enforces need, why, one primary action, and a GitHub source.
+ Approve/merge only links to GitHub. Only Joe's browser session can mark an
+ item done (`POST /waiting/handled`), never for approve/merge items.
 - Browser routes live in `DASHBOARD_ROUTES`, outside `/v1`. They use the
  session cookie from `homelab/waiting_web.py`. Never let the cookie open `/v1`
  or the bearer token open `/waiting/*`.
@@ -56,15 +70,15 @@
 - Verify a change end to end:
  `./.venv/bin/python -m homelab.waiting_cli demo --port 8099` in one shell,
  then `./.venv/bin/python -m homelab.waiting_cli verify --url
- http://127.0.0.1:8099 --token demo-token-not-a-secret --exercise-feedback`.
+ http://127.0.0.1:8099 --token demo-token-not-a-secret --exercise`.
  It prints a JSON report and exits 1 on any failed check. Without
- `--exercise-feedback` it is read-only and safe to run against production with
- the real token.
+ `--exercise` it is read-only and safe to run against production with the
+ real token.
 - Visual changes: with the demo running, `./.venv/bin/python
  scripts/waiting_browser_check.py --out /tmp/waiting-shots` (needs
  `playwright` and Chrome) screenshots desktop and mobile in light and dark
- mode, checks live updates, the polling fallback, and feedback, and prints a
- JSON report.
+ mode, checks categories, primary actions, copy, live arrival and removal,
+ the polling fallback, and feedback, and prints a JSON report.
 
 ## Public API Documentation
 

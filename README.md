@@ -163,27 +163,48 @@ does not forward the audio file, and the route rejects bodies over 9 MiB. See
 [Pebble ring relay](docs/architecture.md#pebble-ring-relay) for the tailnet
 fallback and the homelab-config secret follow-up.
 
-### See what is waiting on Joe
+### See what needs Joe
 
 Open <https://waiting.home.feocco.com> and sign in once with
-`HOMELAB_FUNCTIONS_TOKEN`. The page lists open, non-draft pull requests across
-`DASHBOARD_GH_OWNER` repos, grouped as ready, checks failing, checks running,
-and changes requested. Every card links to its GitHub pull request. The page
-updates over server-sent events, falls back to polling every 30 seconds, and
-shows its live state and when GitHub was last read.
+`HOMELAB_FUNCTIONS_TOKEN`. The page is an inbox of only the things that need
+Joe, in seven categories: PR approve/merge, deploy approval, secret or key
+needed, DNS or infra decision, question to answer, copy/paste value or
+command, and evidence to review. Each item shows what is needed, why, one
+primary action, and a link to its source on GitHub. Copy items copy their
+value in one click. Items leave the page live once they are handled. The page
+updates over server-sent events and falls back to polling every 30 seconds.
 
-**Send feedback** on a card starts one Cursor agent for that pull request. The
-agent opens one pull request for Joe to review. More feedback on the same card
-goes to the same agent. Feedback never approves, merges, or deploys anything.
+A pull request becomes an approve/merge item when it is open, not a draft,
+its checks passed or it has none, nobody requested changes, and it has no
+merge conflict. Joe merges on GitHub himself; the inbox never approves or
+merges.
+
+Agents put everything else in the inbox with one task-list line in a pull
+request or issue body or comment:
+
+```markdown
+- [ ] **Joe: secret** Add `DASHBOARD_GH_APP_KEY` as one base64 line. Why: the inbox cannot read GitHub without it. Action: https://github.com/feocco/homelab-config/settings/secrets/actions
+- [ ] **Joe: copy** Publish the inbox DNS record. Why: the route needs it. Copy: `./scripts/dispatch-route-dns --mode apply --watch`
+```
+
+Kinds are `deploy`, `secret` (or `key`), `infra` (or `dns`), `question`,
+`copy`, and `evidence`. `Action:` takes one https URL; `copy` asks need
+`Copy:`. Ticking the box, deleting the line, or closing the source removes
+the item; Joe can also press **Done**. Lines the inbox cannot read show up in
+the snapshot's `rejected` list with the reason.
+
+**Send feedback** on an item starts one Cursor agent for it, and that agent
+opens one pull request for Joe to review. More feedback on the same item goes
+to the same agent. Feedback never approves, merges, or deploys anything.
 
 Agents read the same snapshot and send the same feedback through the broker:
 
 ```python
 import homelab
 
-waiting = homelab.get_waiting_items()
-first = waiting["items"][0]
-homelab.send_waiting_feedback(first["id"], "Split the CSS into its own file.", request_id="joe-2026-11-01-a")
+inbox = homelab.get_waiting_items()
+first = inbox["items"][0]
+homelab.send_waiting_feedback(first["id"], "Use the base64 form of the key.", request_id="joe-2026-11-01-a")
 ```
 
 See [Waiting on me](docs/architecture.md#waiting-on-me) for auth, identity,
@@ -224,7 +245,7 @@ shows the full API.
 Protected actions are declared in `homelab.access.ACCESS_VECTOR`. The routes,
 OpenAPI document, client methods, MCP tools, and `/docs` page all come from it.
 `POST /v1/pebble` is the HTTP-only exception in `HTTP_ONLY_OPERATIONS`.
-The dashboard's browser routes are in `DASHBOARD_ROUTES` and use a session
+The inbox's browser routes are in `DASHBOARD_ROUTES` and use a session
 cookie instead of the bearer token. These routes are public:
 
 - `GET /health`
@@ -268,10 +289,10 @@ CURSOR_API_KEY=
 WAITING_FEEDBACK_PATH=/app/data/waiting-feedback.sqlite3
 ```
 
-The dashboard reads GitHub only when all four `DASHBOARD_GH_*` values are set.
+The inbox reads GitHub only when all four `DASHBOARD_GH_*` values are set.
 `DASHBOARD_GH_APP_KEY` is the App's RSA private key. A `.env` value is one
 line, so store it base64-encoded (`base64 -w0 key.pem`) or with `\n` escapes.
-Without `CURSOR_API_KEY`, the dashboard still shows pull requests and says that
+Without `CURSOR_API_KEY`, the inbox still shows every item and says that
 feedback is off.
 
 `PEBBLE_RING_TOKEN` and `GROK_PEBBLE_WEBHOOK_KEY` are required before the
@@ -305,10 +326,10 @@ MCP tools, `/docs` page, caller matrix, or skill drift apart. See
 [What changes together](docs/architecture.md#what-changes-together) before
 adding an action.
 
-Run the dashboard on fake data, then check it end to end:
+Run the inbox on fake data, then check it end to end:
 
 ```bash
 ./.venv/bin/python -m homelab.waiting_cli demo --port 8099
 ./.venv/bin/python -m homelab.waiting_cli verify --url http://127.0.0.1:8099 \
-  --token demo-token-not-a-secret --exercise-feedback
+  --token demo-token-not-a-secret --exercise
 ```
