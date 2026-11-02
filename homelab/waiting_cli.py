@@ -393,7 +393,11 @@ def _exercise(http: _Http, bearer, browser, health, items, check) -> None:
     request_id = f"verify-{secrets.token_hex(6)}"
     first_payload = {"item_id": target["id"], "feedback": "Verify: first note.", "request_id": request_id}
     status, first = http.post_json("/v1/waiting/feedback", bearer, first_payload)
-    check("first feedback launches one agent", status == 200 and first.get("delivery") == "launch", first)
+    check(
+        "feedback reaches the item's agent (a launch the first time)",
+        status == 200 and first.get("delivery") in ("launch", "followup", "steer"),
+        first,
+    )
     status, again = http.post_json("/v1/waiting/feedback", bearer, first_payload)
     check("resending the same request_id is a no-op", status == 200 and again.get("duplicate") is True, again)
     status, second = http.post_json(

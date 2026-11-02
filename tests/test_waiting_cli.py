@@ -23,9 +23,13 @@ class VerifyCommandTests(unittest.TestCase):
         self.background.close()
         self.tmp.cleanup()
 
-    def test_verify_with_exercise_passes_against_the_demo(self):
+    def test_verify_with_exercise_passes_against_the_demo_and_can_run_again(self):
         report = verify(self.url, DEMO_TOKEN, exercise=True)
         self.assertTrue(report["ok"], json.dumps(report, indent=2))
+        first = next(check for check in report["checks"] if check["name"].startswith("feedback reaches"))
+        self.assertEqual(first["detail"]["delivery"], "launch")
+        again = verify(self.url, DEMO_TOKEN, exercise=True)
+        self.assertTrue(again["ok"], json.dumps(again, indent=2))
         names = [check["name"] for check in report["checks"]]
         for expected in (
             "HTML, SSE, snapshot JSON, and /v1/waiting are one document",
