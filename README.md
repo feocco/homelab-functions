@@ -158,10 +158,14 @@ curl -sS -X POST "$HOMELAB_FUNCTIONS_URL/v1/pebble" \
 
 The server forwards JSON, including `event_id`, `event_type`, `timestamp`,
 `transcript`, `audio_duration_seconds`, and allowlisted Pebble source fields.
-Events more than five minutes from the server clock are rejected. The server
-does not forward the audio file, and the route rejects bodies over 9 MiB. See
+`single-click-hold` goes to the personal webhook. `double-click-hold` goes to
+the work webhook and fails with 503 `work_webhook_not_configured` when
+`GROK_PEBBLE_WORK_WEBHOOK_URL` or `GROK_PEBBLE_WORK_WEBHOOK_KEY` is unset.
+Any other gesture is rejected. Events more than five minutes from the server
+clock are rejected. The server does not forward the audio file, and the route
+rejects bodies over 9 MiB. See
 [Pebble ring relay](docs/architecture.md#pebble-ring-relay) for the tailnet
-fallback and the homelab-config secret follow-up.
+fallback and the homelab-config follow-up.
 
 ### Use the MCP server or Cursor plugin
 
@@ -226,6 +230,8 @@ HOMELAB_SMOKE_SIGNAL_TARGETS_PATH=/app/config/smoke-signal-targets.json
 PEBBLE_RING_TOKEN=replace_me
 GROK_PEBBLE_WEBHOOK_KEY=replace_me
 GROK_PEBBLE_WEBHOOK_URL=https://api2.cursor.sh/automations/webhook/e3f09362-8a64-5de6-989c-c5d4b75e6238
+GROK_PEBBLE_WORK_WEBHOOK_URL=
+GROK_PEBBLE_WORK_WEBHOOK_KEY=
 XAI_API_KEY=
 XAI_STT_MODEL=grok-voice-transcribe-2.0
 PEBBLE_LEDGER_PATH=/app/data/pebble-events.sqlite3
@@ -233,10 +239,13 @@ PEBBLE_AUDIO_DIR=/app/data/pebble-audio
 PEBBLE_AUDIO_TTL_SECONDS=86400
 ```
 
-`PEBBLE_RING_TOKEN` and `GROK_PEBBLE_WEBHOOK_KEY` are required before the
-ring route will forward. `GROK_PEBBLE_WEBHOOK_URL` defaults to the Cursor
-webhook above when unset. `XAI_API_KEY` is required only when audio arrives
-without a transcription. The other pebble variables have the defaults shown.
+`PEBBLE_RING_TOKEN` and `GROK_PEBBLE_WEBHOOK_KEY` are required before a
+single press-and-hold will forward. `GROK_PEBBLE_WEBHOOK_URL` defaults to the
+Cursor webhook above when unset. `GROK_PEBBLE_WORK_WEBHOOK_URL` and
+`GROK_PEBBLE_WORK_WEBHOOK_KEY` have no default. A double press-and-hold
+returns 503 until both are set, and it is not sent to the personal webhook.
+`XAI_API_KEY` is required only when audio arrives without a transcription.
+The other pebble variables have the defaults shown.
 
 Python client and MCP server:
 

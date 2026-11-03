@@ -56,7 +56,7 @@ Use `get_workflow_report` when you already have a report id and need that one re
 
 ## Pebble ring relay
 
-`POST /v1/pebble` is HTTP-only. It is not an MCP tool and not a `HomelabFunctionsClient` method. The Pebble app authenticates with `PEBBLE_RING_TOKEN`. That token is not `HOMELAB_FUNCTIONS_TOKEN`. Do not send ring audio through any other action.
+`POST /v1/pebble` is HTTP-only. It is not an MCP tool and not a `HomelabFunctionsClient` method. The Pebble app authenticates with `PEBBLE_RING_TOKEN`. That token is not `HOMELAB_FUNCTIONS_TOKEN`. Do not send ring audio through any other action. `single-click-hold` forwards to the personal webhook, `GROK_PEBBLE_WEBHOOK_URL` and `GROK_PEBBLE_WEBHOOK_KEY`. `double-click-hold` forwards to the work webhook, `GROK_PEBBLE_WORK_WEBHOOK_URL` and `GROK_PEBBLE_WORK_WEBHOOK_KEY`. Do not add a tool or a second route for that split.
 
 ## Direct Home Assistant access
 

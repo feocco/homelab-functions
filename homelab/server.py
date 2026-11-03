@@ -90,6 +90,8 @@ class Config:
     pebble_ring_token: str = ""
     grok_pebble_webhook_url: str = DEFAULT_GROK_PEBBLE_WEBHOOK_URL
     grok_pebble_webhook_key: str = ""
+    grok_pebble_work_webhook_url: str = ""
+    grok_pebble_work_webhook_key: str = ""
     xai_api_key: str = ""
     xai_stt_model: str = DEFAULT_STT_MODEL
     pebble_ledger_path: str = "/app/data/pebble-events.sqlite3"
@@ -139,6 +141,8 @@ class Config:
             grok_pebble_webhook_url=os.environ.get("GROK_PEBBLE_WEBHOOK_URL")
             or DEFAULT_GROK_PEBBLE_WEBHOOK_URL,
             grok_pebble_webhook_key=os.environ.get("GROK_PEBBLE_WEBHOOK_KEY", ""),
+            grok_pebble_work_webhook_url=os.environ.get("GROK_PEBBLE_WORK_WEBHOOK_URL", "").strip(),
+            grok_pebble_work_webhook_key=os.environ.get("GROK_PEBBLE_WORK_WEBHOOK_KEY", "").strip(),
             xai_api_key=os.environ.get("XAI_API_KEY", ""),
             xai_stt_model=os.environ.get("XAI_STT_MODEL") or DEFAULT_STT_MODEL,
             pebble_ledger_path=os.environ.get(
@@ -574,6 +578,7 @@ def create_app(
         config.homelab_functions_token,
         config.pebble_ring_token,
         config.grok_pebble_webhook_key,
+        config.grok_pebble_work_webhook_key,
         config.xai_api_key,
         config.ha_long_lived_token,
     )
