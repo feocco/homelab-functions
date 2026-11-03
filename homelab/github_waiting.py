@@ -28,7 +28,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -91,6 +91,7 @@ ACTION_LABELS: dict[Category, str] = {
 }
 _ASK_LINE = re.compile(r"^\s*[-*]\s+\[(?P<mark>[ xX])\]\s+\*\*Joe:\s*(?P<kind>[^*]+?)\s*\*\*\s*(?P<rest>.*)$")
 _ASK_TAIL = re.compile(r"^(?P<why>.+?)(?:\s+(?P<target_kind>Action|Copy):\s+(?P<target>\S.*))?$")
+_FENCE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<rest>.*)$")
 _MAX_NEED, _MAX_WHY, _MAX_COPY = 300, 600, 2000
 
 
@@ -414,7 +415,7 @@ def parse_asks(
 
     items: list[InboxItem] = []
     rejected: list[RejectedAsk] = []
-    for line in text.splitlines():
+    for line in _markdown_lines(text):
         match = _ASK_LINE.match(line)
         if match is None or match["mark"] != " ":
             continue
@@ -471,3 +472,24 @@ def parse_asks(
             )
         )
     return items, rejected
+
+
+def _markdown_lines(text: str) -> Iterator[str]:
+    """Yield prose lines, excluding fenced code blocks that only show examples."""
+
+    fence: str | None = None
+    for line in text.splitlines():
+        match = _FENCE.match(line)
+        if fence is None:
+            if match is not None:
+                fence = match["marker"]
+                continue
+            yield line
+            continue
+        if (
+            match is not None
+            and match["marker"][0] == fence[0]
+            and len(match["marker"]) >= len(fence)
+            and not match["rest"].strip()
+        ):
+            fence = None
