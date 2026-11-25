@@ -70,11 +70,15 @@ class PebbleRequestError(Exception):
         message: str,
         *,
         detail: str | None = None,
+        upstream_status: int | None = None,
+        upstream_body: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.detail = detail
+        self.upstream_status = upstream_status
+        self.upstream_body = upstream_body
 
 
 class WebhookError(Exception):
@@ -554,6 +558,8 @@ class XaiSpeechTranscriber:
                             HTTPStatus.BAD_GATEWAY,
                             "transcription_failed",
                             "Speech-to-text request failed",
+                            upstream_status=response.status,
+                            upstream_body=raw.decode("utf-8", errors="replace")[:500],
                         )
         except asyncio.TimeoutError as exc:
             raise PebbleRequestError(
@@ -617,6 +623,7 @@ async def relay_event(
     ledger: PebbleLedger,
     forwarder: Any,
     transcriber: Any | None,
+    on_transcript: Any | None = None,
 ) -> dict[str, Any]:
     if not settings.ring_token:
         raise PebbleRequestError(
@@ -682,6 +689,8 @@ async def relay_event(
             transcribed = await active.transcribe(audio or b"", filename=filename, content_type=content_type)
             transcript_text = transcribed.text
             duration = transcribed.duration_seconds
+            if on_transcript is not None:
+                await on_transcript()
         payload = _forward_payload(event, transcript_text or "", duration, fields)
         await forwarder.post_json(webhook_url, webhook_key, payload)
     except Exception:

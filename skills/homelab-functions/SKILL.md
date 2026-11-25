@@ -4,7 +4,8 @@ description: >-
   Use the homelab-functions broker for named actions such as notify_joe,
   notify_jess, list_notifications, record_notification_action,
   get_service_catalog, get_smoke_signal_targets, record_workflow_report,
-  list_workflow_reports, and get_workflow_report. For Home Assistant state,
+  list_workflow_reports, get_workflow_report, report_credit, and
+  get_credit_status. For Home Assistant state,
   events, and service calls, use homelab.HomeAssistantWebSocketClient.
 ---
 
@@ -53,6 +54,14 @@ Use `list_workflow_reports` to read recent workflow reports. Filter with `workfl
 ## Get one workflow report
 
 Use `get_workflow_report` when you already have a report id and need that one record.
+
+## Report a credit observation
+
+Use `report_credit` when a service sees an error, a success, or a balance from xAI, X, OpenAI, or Cursor. Pass the provider, the service name, and the kind. Include the HTTP status and a redacted body for errors. The broker classifies credit outages, remembers one state per provider, and alerts Joe once per change. These actions only detect and alert. They do not buy credits.
+
+## Read credit status
+
+Use `get_credit_status` to read the stored state of xAI, X, OpenAI, and Cursor.
 
 ## Pebble ring relay
 

@@ -47,6 +47,7 @@ DOMAIN_SUMMARIES = {
     "Workflow reports": (
         "Durable “please investigate” records submitted from a notification’s Report button."
     ),
+    "Credits": "Report provider credit observations and alert Joe when a provider runs out.",
 }
 
 EXAMPLE_VALUES: Mapping[str, Any] = {
@@ -66,10 +67,19 @@ EXAMPLE_VALUES: Mapping[str, Any] = {
     "notification_id": 42,
     "workflow": "cat-food-monitor",
     "report_id": 123,
+    "provider": "xai",
+    "service": "pirate-radio",
+    "kind": "error",
+    "status": 403,
+    "body": "used all available credits",
+    "balance_usd": 3.4,
+    "daily_burn_usd": 1.6,
+    "observed_at": "2026-11-20T15:04:00+00:00",
 }
 _FALLBACK_BY_TYPE: Mapping[str, Any] = {
     "string": "example",
     "integer": 1,
+    "number": 1.5,
     "object": {},
     "array": [],
 }

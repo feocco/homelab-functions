@@ -139,6 +139,23 @@ targets = homelab.get_smoke_signal_targets()["targets"]
 returns them. `GET /docs` is the page the catalog links as this service's
 docs.
 
+### Report a provider credit observation
+
+`pirate-radio` and a future `homelab-monitor` exporter call `report_credit` with `HOMELAB_FUNCTIONS_TOKEN`. The broker detects a credit outage and alerts Joe. It does not buy credits or call a billing endpoint.
+
+```python
+homelab.report_credit(
+    "xai",
+    "pirate-radio",
+    "error",
+    status=403,
+    body="used all available credits",
+)
+state = homelab.get_credit_status()
+```
+
+`get_credit_status` returns one row per provider. Pebble speech-to-text failures are classified on the same path inside the broker.
+
 ### Relay a Pebble Index recording
 
 The phone posts to `POST /v1/pebble`. This route is HTTP-only. It is not a
