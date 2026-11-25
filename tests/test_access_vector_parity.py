@@ -34,7 +34,10 @@ TIMESTAMP = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$"
 
 STRING = {"type": "string"}
 INTEGER = {"type": "integer"}
+NUMBER = {"type": "number"}
 OBJECT = {"type": "object"}
+CREDIT_PROVIDER = {"type": "string", "enum": ["xai", "x", "openai", "cursor"]}
+CREDIT_KIND = {"type": "string", "enum": ["error", "success", "balance"]}
 BUTTONS = {
     "type": "array",
     "maxItems": 3,
@@ -208,6 +211,39 @@ CONTRACTS = (
         ),
         "errors": REPORT_ERRORS,
     },
+    {
+        "operation_id": "report_credit",
+        "method": "POST",
+        "path": "/v1/credits/report",
+        "summary": "Report a provider credit observation",
+        "description": (
+            "Record an error, success, or balance observation and alert Joe "
+            "when the provider credit state changes."
+        ),
+        "domain": "Credits",
+        "parameters": (
+            {"name": "provider", "location": "body", "required": True, "schema": CREDIT_PROVIDER},
+            {"name": "service", "location": "body", "required": True, "schema": STRING},
+            {"name": "kind", "location": "body", "required": True, "schema": CREDIT_KIND},
+            {"name": "status", "location": "body", "required": False, "schema": INTEGER},
+            {"name": "body", "location": "body", "required": False, "schema": STRING},
+            {"name": "balance_usd", "location": "body", "required": False, "schema": NUMBER},
+            {"name": "daily_burn_usd", "location": "body", "required": False, "schema": NUMBER},
+            {"name": "observed_at", "location": "body", "required": False, "schema": STRING},
+        ),
+        "errors": NOTIFY_ERRORS,
+        "body_component": "CreditReportRequest",
+    },
+    {
+        "operation_id": "get_credit_status",
+        "method": "GET",
+        "path": "/v1/credits/status",
+        "summary": "Return credit state for each provider",
+        "description": "Return the stored credit state of xAI, X, OpenAI, and Cursor.",
+        "domain": "Credits",
+        "parameters": (),
+        "errors": (UNAUTHORIZED,),
+    },
 )
 
 EXPECTED_IDS = (
@@ -220,6 +256,8 @@ EXPECTED_IDS = (
     "record_workflow_report",
     "list_workflow_reports",
     "get_workflow_report",
+    "report_credit",
+    "get_credit_status",
 )
 EXPECTED_ROUTES = (
     ("POST", "/v1/notify/joe"),
@@ -231,6 +269,8 @@ EXPECTED_ROUTES = (
     ("POST", "/v1/workflow-reports"),
     ("GET", "/v1/workflow-reports"),
     ("GET", "/v1/workflow-reports/{report_id}"),
+    ("POST", "/v1/credits/report"),
+    ("GET", "/v1/credits/status"),
     ("POST", "/v1/pebble"),
 )
 
@@ -241,6 +281,7 @@ PUBLIC_EXPORTS = [
     "HomelabFunctionsClient",
     "HomelabFunctionsError",
     "NotificationActionRouter",
+    "get_credit_status",
     "get_service_catalog",
     "get_smoke_signal_targets",
     "get_workflow_report",
@@ -250,6 +291,7 @@ PUBLIC_EXPORTS = [
     "notify_joe",
     "record_notification_action",
     "record_workflow_report",
+    "report_credit",
     "workflow_report_button",
     "websocket_url",
 ]
@@ -825,6 +867,42 @@ class ClientHelperTests(unittest.TestCase):
                 {},
                 None,
             ),
+            (
+                lambda: homelab.report_credit(
+                    "xai",
+                    "pirate-radio",
+                    "error",
+                    status=403,
+                    body="used all available credits",
+                    balance_usd=0,
+                    daily_burn_usd=1.6,
+                    observed_at="2026-11-20T15:04:00+00:00",
+                    service_url=base,
+                    token=token,
+                ),
+                {"marker": "report_credit"},
+                "POST",
+                "/v1/credits/report",
+                {},
+                {
+                    "provider": "xai",
+                    "service": "pirate-radio",
+                    "kind": "error",
+                    "status": 403,
+                    "body": "used all available credits",
+                    "balance_usd": 0,
+                    "daily_burn_usd": 1.6,
+                    "observed_at": "2026-11-20T15:04:00+00:00",
+                },
+            ),
+            (
+                lambda: homelab.get_credit_status(service_url=base, token=token),
+                {"marker": "get_credit_status"},
+                "GET",
+                "/v1/credits/status",
+                {},
+                None,
+            ),
         ]
         seen = set()
         for invoke, payload, method, path, query, body in specs:
@@ -1039,7 +1117,7 @@ class OpenAPITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog.status, 401)
 
     async def test_every_registry_route_rejects_missing_bearer(self):
-        self.assertEqual(len(ACCESS_VECTOR), 9)
+        self.assertEqual(len(ACCESS_VECTOR), 11)
         for operation in ACCESS_VECTOR:
             path = operation.path
             for parameter in operation.parameters:
@@ -1571,6 +1649,48 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn(TOKEN, json.dumps(missing_body))
         self.assertNotIn(TOKEN, self.read_stderr())
 
+    def test_credit_report_and_status_round_trip(self):
+        status = self.api.get_credit_status()
+        self.assertEqual(
+            [item["provider"] for item in status["providers"]],
+            ["xai", "x", "openai", "cursor"],
+        )
+        self.assertEqual(status["providers"][0]["state"], "ok")
+        listed_error, listed = self.call_tool("get_credit_status", {})
+        self.assertFalse(listed_error)
+        self.assertEqual(listed["providers"][1]["provider"], "x")
+
+        reported = self.api.report_credit(
+            "xai",
+            "pirate-radio",
+            "error",
+            status=403,
+            body="used all available credits",
+        )
+        self.assertEqual(reported["state"], "out")
+        self.assertTrue(reported["pushed"])
+        self.assertEqual(self.fake.calls[-1]["notify_service"], JOE_SERVICE)
+        self.assertEqual(self.fake.calls[-1]["service_data"]["data"]["group"], "api-credits")
+        self.assertEqual(self.fake.calls[-1]["service_data"]["data"]["tag"], "api-credits-xai")
+        self.assertEqual(
+            self.fake.calls[-1]["service_data"]["data"]["actions"],
+            [{"title": "Open billing", "action": "URI", "uri": "https://console.x.ai"}],
+        )
+
+        mcp_error, mcp_body = self.call_tool(
+            "report_credit",
+            {
+                "provider": "cursor",
+                "service": "cursor-agent",
+                "kind": "error",
+                "body": "usage_limit",
+            },
+        )
+        self.assertFalse(mcp_error)
+        self.assertEqual(mcp_body["state"], "out")
+        self.assertEqual(mcp_body["push_kind"], "out")
+        self.assertEqual(self.fake.calls[-1]["service_data"]["data"]["tag"], "api-credits-cursor")
+
 
 EXPECTED_CALLERS = (
     {
@@ -1614,6 +1734,33 @@ EXPECTED_CALLERS = (
         "helpers": (),
         "groups": (),
         "tags": (),
+        "prefixes": (),
+    },
+    {
+        "slug": "pirate-radio",
+        "label": "`pirate-radio`",
+        "uses": (("report_credit", ""),),
+        "helpers": (),
+        "groups": (),
+        "tags": (),
+        "prefixes": (),
+    },
+    {
+        "slug": "homelab-monitor",
+        "label": "`homelab-monitor`",
+        "uses": (("report_credit", ""), ("get_credit_status", "")),
+        "helpers": (),
+        "groups": (),
+        "tags": (),
+        "prefixes": (),
+    },
+    {
+        "slug": "credit-watch",
+        "label": "`credit-watch`",
+        "uses": (("notify_joe", ""),),
+        "helpers": (),
+        "groups": ("api-credits",),
+        "tags": ("api-credits-*",),
         "prefixes": (),
     },
 )

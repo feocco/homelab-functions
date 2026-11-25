@@ -52,6 +52,9 @@ parity tests check that this table matches it exactly.
 | `homelab-sre-agent` | `notify_joe`, `record_notification_action`, `list_notifications` | `homelab-sre` | `sre-incident-<id>` | `SRE_APPROVE`, `SRE_IGNORE` |
 | Household/runtime workflows: `cat-food-monitor`, `laundry-monitor`, `plant-monitor`, `bedtime`, `mealie-planner` | `notify_joe`, `notify_jess`, `record_workflow_report`, `workflow_report_button("<workflow-slug>")` | — | — | `WORKFLOW_REPORT` |
 | `smoke-signal` & runtime checkers | `get_service_catalog`, `get_smoke_signal_targets` | — | — | — |
+| `pirate-radio` | `report_credit` | — | — | — |
+| `homelab-monitor` | `report_credit`, `get_credit_status` | — | — | — |
+| `credit-watch` | `notify_joe` | `api-credits` | `api-credits-*` | — |
 
 Groups, tags, and action prefixes are conventions for the shared notification
 ledger. The server does not enforce them. They matter because the ledger is
@@ -108,6 +111,14 @@ list during deploy and mounts them into the container. `get_service_catalog`
 and `get_smoke_signal_targets` check the bearer token and return the files
 unchanged. Runtime checkers get a cacheable view of the homelab without
 cloning `homelab-config`.
+
+## Credit alerts
+
+The broker sends the push itself through the Home Assistant notify client. `report_credit` records an error, a success, or a balance for xAI, X, OpenAI, or Cursor. `pirate-radio` and a future `homelab-monitor` exporter call it with the service token. `get_credit_status` returns the stored state. Pebble STT failures are classified on the same path. Nothing in this feature calls a billing API.
+
+Each provider is `ok`, `low`, or `out`. The low line is the larger of the provider floor and three days of the latest daily burn. xAI, OpenAI, and Cursor use a $5 floor. X uses $2. A balance at or below zero, or a classified credit error, moves the provider to `out`. A balance below the low line moves it to `low`. It returns to `ok` when the balance reaches the low line plus $1, or when a success arrives while the provider is `out`. Joe gets one push on each state change. A later report at least 24 hours after the last out push sends one reminder. The group is `api-credits` and the tag is `api-credits-<provider>`. The only button is Open billing.
+
+Migration 1 adds `credit_provider_state` to the existing notification ledger file on process start. A second open does not insert another `schema_migrations` row.
 
 ## Security model
 

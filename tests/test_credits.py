@@ -1,9 +1,12 @@
 import ast
+import json
 import sqlite3
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from aiohttp.test_utils import TestClient, TestServer
 
 from homelab.credits import (
     BODY_LIMIT,
@@ -13,8 +16,11 @@ from homelab.credits import (
     render_push,
 )
 from homelab.notification_ledger import NotificationLedger
+from homelab.server import Config, HomeAssistantError, create_app
 
 
+TOKEN = "credit-token-do-not-leak"
+JOE_SERVICE = "notify.mobile_app_pixel"
 REDACTED_PREFIX = (
     '{"code":"The caller does not have permission to execute the specified operation","error":"Your team 3088e1fd-'
 )
@@ -29,6 +35,457 @@ XAI_OUT = (
     "and Home Assistant Grok voice will fail. Add credits in the xAI console; "
     "I'll tell you when it's working again."
 )
+XAI_OUT_UNKNOWN = (
+    "Pirate Radio conversions are paused. Add credits in the xAI console; "
+    "I'll tell you when it's working again."
+)
+XAI_LOW = (
+    "$3.40 left, about 2 days at your recent use ($1.60/day). "
+    "At $0, Pirate Radio conversions pause."
+)
+XAI_RECOVERED = "Balance $20.00. Pirate Radio conversions resumed."
+XAI_REMINDER = (
+    "Pirate Radio conversions are paused. 3 credit errors since it ran out. "
+    "Add credits in the xAI console; I'll tell you when it's working again."
+)
+XAI_REMINDER_THREE = (
+    "Pirate Radio conversions are paused, and Pebble voice notes and "
+    "Home Assistant Grok voice will fail. 4 credit errors since it ran out. "
+    "Add credits in the xAI console; I'll tell you when it's working again."
+)
+T0 = "2026-11-20T15:04:00+00:00"
+T1 = "2026-11-20T15:05:00+00:00"
+T2 = "2026-11-20T15:06:00+00:00"
+T24 = "2026-11-21T15:04:00+00:00"
+T24_PLUS = "2026-11-21T15:05:00+00:00"
+
+
+class FakeHomeAssistant:
+    def __init__(self, *, fail_first: bool = False, timeout_first: bool = False):
+        self.calls = []
+        self.fail_first = fail_first
+        self.timeout_first = timeout_first
+        self.failures = 0
+
+    async def send_notification(self, service_data, *, notify_service):
+        if self.fail_first and self.failures == 0:
+            self.failures += 1
+            raise HomeAssistantError(f"notify down {TOKEN}")
+        if self.timeout_first and self.failures == 0:
+            self.failures += 1
+            raise TimeoutError(TOKEN)
+        self.calls.append(
+            {
+                "notify_service": notify_service,
+                "service_data": json.loads(json.dumps(service_data)),
+            }
+        )
+        return "context-credits"
+
+
+def write_config(tmp: Path) -> Config:
+    catalog = tmp / "catalog.json"
+    targets = tmp / "targets.json"
+    catalog.write_text("{}", encoding="utf-8")
+    targets.write_text("{}", encoding="utf-8")
+    return Config(
+        ha_url="https://example.ui.nabu.casa",
+        ha_long_lived_token="ha-token",
+        ha_notify_joe_service=JOE_SERVICE,
+        ha_notify_jess_service="notify.mobile_app_jess",
+        homelab_functions_token=TOKEN,
+        notification_ledger_path=str(tmp / "notifications.sqlite3"),
+        notification_action_recorder_enabled=False,
+        homelab_catalog_path=str(catalog),
+        homelab_smoke_signal_targets_path=str(targets),
+        xai_api_key="xai-test-key",
+        pebble_ring_token="pebble-ring-token",
+        grok_pebble_webhook_key="webhook-key",
+        grok_pebble_work_webhook_url="https://work.example/hook",
+        grok_pebble_work_webhook_key="work-key",
+        pebble_ledger_path=str(tmp / "pebble.sqlite3"),
+        pebble_audio_dir=str(tmp / "audio"),
+    )
+
+
+class CreditHttpTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = TemporaryDirectory()
+        self.fake = FakeHomeAssistant()
+        self.client = TestClient(
+            TestServer(create_app(write_config(Path(self.tmp.name)), ha_client=self.fake))
+        )
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.tmp.cleanup()
+
+    async def report(self, payload, *, token=TOKEN):
+        headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+        return await self.client.post("/v1/credits/report", json=payload, headers=headers)
+
+    async def status(self, *, token=TOKEN):
+        headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+        return await self.client.get("/v1/credits/status", headers=headers)
+
+    def push(self, index=0):
+        return self.fake.calls[index]["service_data"]
+
+    async def test_xai_credit_body_dedupes_reminds_and_recovers(self):
+        first = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": CREDIT_BODY,
+                "observed_at": T0,
+            }
+        )
+        self.assertEqual(first.status, 200)
+        body = await first.json()
+        self.assertTrue(body["classified"])
+        self.assertEqual(body["previous_state"], "ok")
+        self.assertEqual(body["state"], "out")
+        self.assertEqual(body["push_kind"], "out")
+        self.assertEqual(body["error_count"], 1)
+        self.assertEqual(self.push()["title"], "xAI is out of credits")
+        self.assertEqual(self.push()["message"], XAI_OUT_UNKNOWN)
+        self.assertEqual(self.push()["data"]["group"], "api-credits")
+        self.assertEqual(self.push()["data"]["tag"], "api-credits-xai")
+        self.assertEqual(self.push()["data"]["ttl"], 0)
+        self.assertEqual(self.push()["data"]["priority"], "high")
+        self.assertEqual(
+            self.push()["data"]["actions"],
+            [{"title": "Open billing", "action": "URI", "uri": "https://console.x.ai"}],
+        )
+
+        second = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 429,
+                "body": CREDIT_BODY,
+                "observed_at": T1,
+            }
+        )
+        self.assertEqual(second.status, 200)
+        second_body = await second.json()
+        self.assertEqual(second_body["state"], "out")
+        self.assertFalse(second_body["pushed"])
+        self.assertEqual(second_body["error_count"], 2)
+        self.assertEqual(len(self.fake.calls), 1)
+
+        reminder = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": CREDIT_BODY,
+                "observed_at": T24,
+            }
+        )
+        self.assertEqual(reminder.status, 200)
+        reminder_body = await reminder.json()
+        self.assertEqual(reminder_body["push_kind"], "reminder")
+        self.assertEqual(reminder_body["error_count"], 3)
+        self.assertEqual(self.push(1)["title"], "xAI is still out of credits")
+        self.assertEqual(self.push(1)["message"], XAI_REMINDER)
+
+        quiet = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": CREDIT_BODY,
+                "observed_at": T24_PLUS,
+            }
+        )
+        self.assertFalse((await quiet.json())["pushed"])
+        self.assertEqual(len(self.fake.calls), 2)
+
+        recovered = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "success",
+                "balance_usd": 20,
+                "observed_at": "2026-11-21T16:00:00+00:00",
+            }
+        )
+        self.assertEqual(recovered.status, 200)
+        recovered_body = await recovered.json()
+        self.assertEqual(recovered_body["state"], "ok")
+        self.assertEqual(recovered_body["push_kind"], "recovered")
+        self.assertEqual(self.push(2)["title"], "xAI credits are back")
+        self.assertEqual(self.push(2)["message"], XAI_RECOVERED)
+
+    async def test_reminder_names_every_service_seen_while_out(self):
+        first = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": "used all available credits",
+                "observed_at": T0,
+            }
+        )
+        self.assertEqual(self.push()["message"], XAI_OUT_UNKNOWN)
+        self.assertEqual((await first.json())["error_count"], 1)
+
+        for service, when in (("pebble", T1), ("home-assistant", T2)):
+            response = await self.report(
+                {
+                    "provider": "xai",
+                    "service": service,
+                    "kind": "error",
+                    "status": 403,
+                    "body": "used all available credits",
+                    "observed_at": when,
+                }
+            )
+            self.assertFalse((await response.json())["pushed"])
+        self.assertEqual(len(self.fake.calls), 1)
+
+        reminder = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": "used all available credits",
+                "observed_at": T24,
+            }
+        )
+        body = await reminder.json()
+        self.assertEqual(body["push_kind"], "reminder")
+        self.assertEqual(body["error_count"], 4)
+        self.assertEqual(body["services"], ["pirate-radio", "pebble", "home-assistant"])
+        self.assertEqual(self.push(1)["title"], "xAI is still out of credits")
+        self.assertEqual(self.push(1)["message"], XAI_REMINDER_THREE)
+        self.assertEqual(len(self.fake.calls), 2)
+
+    async def test_balance_zero_after_low_names_every_service_seen(self):
+        low = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "balance",
+                "balance_usd": 3.4,
+                "daily_burn_usd": 1.6,
+                "observed_at": T0,
+            }
+        )
+        self.assertEqual(low.status, 200)
+        self.assertEqual((await low.json())["state"], "low")
+        self.assertEqual(self.push()["title"], "xAI credits running low")
+        self.assertEqual(self.push()["message"], XAI_LOW)
+
+        for service, when in (("pebble", T1), ("home-assistant", T2)):
+            response = await self.report(
+                {
+                    "provider": "xai",
+                    "service": service,
+                    "kind": "balance",
+                    "balance_usd": 3.4,
+                    "observed_at": when,
+                }
+            )
+            self.assertFalse((await response.json())["pushed"])
+        self.assertEqual(len(self.fake.calls), 1)
+
+        out = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "balance",
+                "balance_usd": 0,
+                "observed_at": "2026-11-20T15:07:00+00:00",
+            }
+        )
+        self.assertEqual((await out.json())["push_kind"], "out")
+        self.assertEqual(self.push(1)["title"], "xAI is out of credits")
+        self.assertEqual(self.push(1)["message"], XAI_OUT)
+        self.assertEqual(len(self.fake.calls), 2)
+
+    async def test_low_hysteresis_and_balance_recovery(self):
+        await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "balance",
+                "balance_usd": 3.4,
+                "daily_burn_usd": 1.6,
+                "observed_at": T0,
+            }
+        )
+        held = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "balance",
+                "balance_usd": 5.5,
+                "observed_at": T1,
+            }
+        )
+        held_body = await held.json()
+        self.assertEqual(held_body["state"], "low")
+        self.assertFalse(held_body["pushed"])
+        recovered = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "balance",
+                "balance_usd": 6,
+                "observed_at": T2,
+            }
+        )
+        self.assertEqual((await recovered.json())["state"], "ok")
+        self.assertEqual(self.push(1)["message"], "Balance $6.00. Pirate Radio conversions resumed.")
+
+    async def test_x_floor_is_two_dollars(self):
+        at_floor = await self.report(
+            {
+                "provider": "x",
+                "service": "x-api",
+                "kind": "balance",
+                "balance_usd": 2,
+                "observed_at": T0,
+            }
+        )
+        self.assertEqual((await at_floor.json())["state"], "ok")
+        self.assertEqual(self.fake.calls, [])
+        below = await self.report(
+            {
+                "provider": "x",
+                "service": "x-api",
+                "kind": "balance",
+                "balance_usd": 1.5,
+                "observed_at": T1,
+            }
+        )
+        self.assertEqual((await below.json())["state"], "low")
+        self.assertEqual(self.push()["title"], "X credits running low")
+        self.assertEqual(
+            self.push()["data"]["actions"],
+            [{"title": "Open billing", "action": "URI", "uri": "https://console.x.com"}],
+        )
+
+    async def test_failed_notify_is_retried_once(self):
+        await self.client.close()
+        self.fake = FakeHomeAssistant(fail_first=True)
+        self.client = TestClient(
+            TestServer(create_app(write_config(Path(self.tmp.name)), ha_client=self.fake))
+        )
+        await self.client.start_server()
+        failed = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": "used all available credits",
+                "observed_at": T0,
+            }
+        )
+        self.assertEqual(failed.status, 502)
+        self.assertNotIn(TOKEN, json.dumps(await failed.json()))
+        self.assertEqual(self.fake.calls, [])
+        current = await self.status()
+        provider = (await current.json())["providers"][0]
+        self.assertEqual(provider["state"], "out")
+        self.assertIsNone(provider["last_push_at"])
+        retried = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": "used all available credits",
+                "observed_at": T1,
+            }
+        )
+        self.assertEqual(retried.status, 200)
+        self.assertTrue((await retried.json())["pushed"])
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.push()["message"], XAI_OUT_UNKNOWN)
+
+    async def test_notify_timeout_is_retried_once(self):
+        await self.client.close()
+        self.fake = FakeHomeAssistant(timeout_first=True)
+        self.client = TestClient(
+            TestServer(create_app(write_config(Path(self.tmp.name)), ha_client=self.fake))
+        )
+        await self.client.start_server()
+        timed_out = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": "used all available credits",
+                "observed_at": T0,
+            }
+        )
+        self.assertEqual(timed_out.status, 504)
+        self.assertNotIn(TOKEN, json.dumps(await timed_out.json()))
+        self.assertEqual(self.fake.calls, [])
+        retried = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": "used all available credits",
+                "observed_at": T1,
+            }
+        )
+        self.assertEqual(retried.status, 200)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.push()["message"], XAI_OUT_UNKNOWN)
+
+    async def test_missing_token_and_bad_provider(self):
+        missing = await self.report(
+            {"provider": "xai", "service": "pirate-radio", "kind": "error"},
+            token=None,
+        )
+        self.assertEqual(missing.status, 401)
+        unauthenticated = await self.status(token=None)
+        self.assertEqual(unauthenticated.status, 401)
+        rejected = await self.report(
+            {"provider": "anthropic", "service": "pirate-radio", "kind": "error"}
+        )
+        self.assertEqual(rejected.status, 400)
+        self.assertEqual((await rejected.json())["error"]["code"], "invalid_request")
+
+    async def test_fresh_balance_recovery_from_out(self):
+        await self.report(
+            {
+                "provider": "openai",
+                "service": "openai-proxy",
+                "kind": "error",
+                "status": 429,
+                "body": '{"error":{"code":"insufficient_quota"}}',
+                "observed_at": T0,
+            }
+        )
+        recovered = await self.report(
+            {
+                "provider": "openai",
+                "service": "openai-proxy",
+                "kind": "balance",
+                "balance_usd": 20,
+                "observed_at": T1,
+            }
+        )
+        self.assertEqual((await recovered.json())["state"], "ok")
+        self.assertEqual(self.push(1)["title"], "OpenAI credits are back")
+        self.assertEqual(self.push(1)["message"], "Balance $20.00. openai-proxy resumed.")
 
 
 class ClassifierTests(unittest.TestCase):
@@ -242,5 +699,3 @@ class BillingBoundaryTests(unittest.TestCase):
         self.assertNotIn("purchase", source.lower())
         self.assertNotIn("checkout", source.lower())
         self.assertIn("https://console.x.ai", source)
-
-

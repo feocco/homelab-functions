@@ -195,6 +195,39 @@ class HomelabFunctionsClient:
 
         return self.call("get_workflow_report", {"report_id": report_id})
 
+    def report_credit(
+        self,
+        provider: str,
+        service: str,
+        kind: str,
+        *,
+        status: int | None = None,
+        body: str | None = None,
+        balance_usd: float | None = None,
+        daily_burn_usd: float | None = None,
+        observed_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Report a provider credit observation."""
+
+        return self.call(
+            "report_credit",
+            {
+                "provider": provider,
+                "service": service,
+                "kind": kind,
+                "status": status,
+                "body": body,
+                "balance_usd": balance_usd,
+                "daily_burn_usd": daily_burn_usd,
+                "observed_at": observed_at,
+            },
+        )
+
+    def get_credit_status(self) -> dict[str, Any]:
+        """Return the stored credit state of xAI, X, OpenAI, and Cursor."""
+
+        return self.call("get_credit_status")
+
     def call(self, operation_id: str, arguments: Mapping[str, Any] | None = None) -> Any:
         """Call one registry operation by id.
 
@@ -482,6 +515,45 @@ def get_workflow_report(
     """Get one workflow report by id."""
 
     return HomelabFunctionsClient(service_url, token, timeout).get_workflow_report(report_id)
+
+
+def get_credit_status(
+    *,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Return the stored credit state of xAI, X, OpenAI, and Cursor."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).get_credit_status()
+
+
+def report_credit(
+    provider: str,
+    service: str,
+    kind: str,
+    *,
+    status: int | None = None,
+    body: str | None = None,
+    balance_usd: float | None = None,
+    daily_burn_usd: float | None = None,
+    observed_at: str | None = None,
+    service_url: str | None = None,
+    token: str | None = None,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Report a provider credit observation. This does not buy credits."""
+
+    return HomelabFunctionsClient(service_url, token, timeout).report_credit(
+        provider,
+        service,
+        kind,
+        status=status,
+        body=body,
+        balance_usd=balance_usd,
+        daily_burn_usd=daily_burn_usd,
+        observed_at=observed_at,
+    )
 
 
 def _parse_error_payload(body: str) -> dict[str, str]:

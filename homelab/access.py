@@ -14,7 +14,16 @@ class _Missing:
 _MISSING = _Missing()
 _STRING: dict[str, Any] = {"type": "string"}
 _INTEGER: dict[str, Any] = {"type": "integer"}
+_NUMBER: dict[str, Any] = {"type": "number"}
 _OBJECT: dict[str, Any] = {"type": "object"}
+_CREDIT_PROVIDER: dict[str, Any] = {
+    "type": "string",
+    "enum": ["xai", "x", "openai", "cursor"],
+}
+_CREDIT_KIND: dict[str, Any] = {
+    "type": "string",
+    "enum": ["error", "success", "balance"],
+}
 _BUTTONS: dict[str, Any] = {
     "type": "array",
     "maxItems": 3,
@@ -401,6 +410,43 @@ ACCESS_VECTOR = AccessVector(
                 AccessError("400", "Invalid report id"),
                 AccessError("404", "Report not found"),
             ),
+        ),
+        AccessOperation(
+            operation_id="report_credit",
+            method="POST",
+            path="/v1/credits/report",
+            summary="Report a provider credit observation",
+            description=(
+                "Record an error, success, or balance observation and alert Joe "
+                "when the provider credit state changes."
+            ),
+            domain="Credits",
+            parameters=(
+                _param("provider", "body", _CREDIT_PROVIDER, required=True),
+                _param("service", "body", _STRING, required=True),
+                _param("kind", "body", _CREDIT_KIND, required=True),
+                _param("status", "body", _INTEGER),
+                _param("body", "body", _STRING),
+                _param("balance_usd", "body", _NUMBER),
+                _param("daily_burn_usd", "body", _NUMBER),
+                _param("observed_at", "body", _STRING),
+            ),
+            errors=_documented_errors(
+                AccessError("400", "Invalid request"),
+                AccessError("502", "Home Assistant rejected the notification request"),
+                AccessError("504", "Timed out calling Home Assistant"),
+            ),
+            body_component="CreditReportRequest",
+        ),
+        AccessOperation(
+            operation_id="get_credit_status",
+            method="GET",
+            path="/v1/credits/status",
+            summary="Return credit state for each provider",
+            description="Return the stored credit state of xAI, X, OpenAI, and Cursor.",
+            domain="Credits",
+            parameters=(),
+            errors=_documented_errors(),
         ),
     )
 )

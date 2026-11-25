@@ -24,6 +24,15 @@ from .access import (
     to_jsonable,
 )
 from .action_recorder import NotificationActionRecorder
+from .credits import (
+    CreditInputError,
+    CreditPush,
+    format_timestamp,
+    parse_credit_report,
+    reduce_credit_state,
+    reduction_payload,
+    credit_status_document,
+)
 from .docs_page import DOCS_HEADERS, service_docs_html
 from .home_assistant import HomeAssistantConfig
 from .notification_ledger import NotificationLedger
@@ -547,6 +556,8 @@ def _register_protected_routes(app: web.Application) -> None:
         "record_workflow_report": record_workflow_report,
         "list_workflow_reports": list_workflow_reports,
         "get_workflow_report": get_workflow_report,
+        "report_credit": report_credit,
+        "get_credit_status": get_credit_status,
     }
     declared = {operation.operation_id for operation in ACCESS_VECTOR}
     registered = set(handlers)
@@ -892,6 +903,97 @@ async def get_workflow_report(request: web.Request) -> web.Response:
     return web.json_response({"report": report})
 
 
+async def report_credit(request: web.Request) -> web.Response:
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return error_response(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            "Request body must be a JSON object",
+        )
+    try:
+        report = parse_credit_report(payload)
+    except CreditInputError as exc:
+        return error_response(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            str(exc),
+            detail=exc.field,
+        )
+    try:
+        result = await deliver_credit_report(request.app, report)
+    except asyncio.TimeoutError:
+        return error_response(
+            HTTPStatus.GATEWAY_TIMEOUT,
+            "ha_timeout",
+            "Timed out calling Home Assistant",
+        )
+    except HomeAssistantError as exc:
+        detail = _detail_without_token(request, exc)
+        LOGGER.warning("credit alert notification failed: %s", detail)
+        return error_response(
+            HTTPStatus.BAD_GATEWAY,
+            "ha_error",
+            "Home Assistant rejected the notification request",
+            detail=detail,
+        )
+    return web.json_response(result)
+
+
+async def get_credit_status(request: web.Request) -> web.Response:
+    snapshots = request.app[LEDGER_KEY].list_credit_snapshots()
+    return web.json_response(credit_status_document(snapshots))
+
+
+async def deliver_credit_report(app: web.Application, report) -> dict[str, Any]:
+    ledger = app[LEDGER_KEY]
+    with ledger.immediate() as connection:
+        previous = ledger.load_credit_snapshot(connection, report.provider)
+        reduction = reduce_credit_state(previous, report)
+        if reduction.persist:
+            ledger.save_credit_snapshot(connection, reduction.snapshot)
+    notification_id = None
+    pushed = False
+    if reduction.push is not None and reduction.push_kind is not None:
+        notification_id = await _send_credit_push(app, reduction.push)
+        ledger.mark_credit_push(
+            report.provider,
+            reduction.push_kind,
+            format_timestamp(report.observed_at),
+        )
+        pushed = True
+    return reduction_payload(
+        report,
+        reduction,
+        pushed=pushed,
+        notification_id=notification_id,
+    )
+
+
+async def _send_credit_push(app: web.Application, push: CreditPush) -> int:
+    config = app[CONFIG_KEY]
+    notification = {
+        "title": push.title,
+        "message": push.message,
+        "tag": push.tag,
+        "group": push.group,
+        "buttons": [dict(button) for button in push.buttons],
+    }
+    validated = validate_notification_payload(notification)
+    service_data = build_service_data(validated)
+    context_id = await app[HA_CLIENT_KEY].send_notification(
+        service_data,
+        notify_service=config.ha_notify_joe_service,
+    )
+    record = app[LEDGER_KEY].record_sent(
+        validated,
+        service_data,
+        ha_context_id=context_id,
+    )
+    return int(record["id"])
+
+
 def parse_limit(raw_limit: str | None, *, default: int) -> int:
     if raw_limit is None or not raw_limit.strip():
         return default
@@ -969,6 +1071,14 @@ def authorized(request: web.Request, expected_token: str) -> bool:
     if not header.startswith(prefix):
         return False
     return hmac.compare_digest(header[len(prefix) :], expected_token)
+
+
+def _detail_without_token(request: web.Request, exc: BaseException) -> str:
+    detail = str(exc)
+    token = request.app[CONFIG_KEY].homelab_functions_token
+    if token:
+        detail = detail.replace(token, "[redacted]")
+    return detail
 
 
 def error_response(

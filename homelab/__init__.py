@@ -17,6 +17,7 @@ _EXPORTS = {
     "HomelabFunctionsClient": ("homelab.client", "HomelabFunctionsClient"),
     "HomelabFunctionsError": ("homelab.client", "HomelabFunctionsError"),
     "NotificationActionRouter": ("homelab.notification_actions", "NotificationActionRouter"),
+    "get_credit_status": ("homelab.client", "get_credit_status"),
     "get_service_catalog": ("homelab.client", "get_service_catalog"),
     "get_smoke_signal_targets": ("homelab.client", "get_smoke_signal_targets"),
     "get_workflow_report": ("homelab.client", "get_workflow_report"),
@@ -26,6 +27,7 @@ _EXPORTS = {
     "notify_joe": ("homelab.client", "notify_joe"),
     "record_notification_action": ("homelab.client", "record_notification_action"),
     "record_workflow_report": ("homelab.client", "record_workflow_report"),
+    "report_credit": ("homelab.client", "report_credit"),
     "workflow_report_button": ("homelab.client", "workflow_report_button"),
     "websocket_url": ("homelab.home_assistant", "websocket_url"),
 }

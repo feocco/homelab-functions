@@ -176,6 +176,57 @@ services = homelab.get_service_catalog()["services"]
 targets = homelab.get_smoke_signal_targets()["targets"]
 ''',
     ),
+    Consumer(
+        slug="pirate-radio",
+        name="pirate-radio",
+        uses=_uses("report_credit"),
+        recipe_title="Report an xAI credit error",
+        recipe='''import homelab
+
+homelab.report_credit(
+    "xai",
+    "pirate-radio",
+    "error",
+    status=403,
+    body="used all available credits",
+)
+''',
+    ),
+    Consumer(
+        slug="homelab-monitor",
+        name="homelab-monitor",
+        uses=_uses("report_credit", "get_credit_status"),
+        recipe_title="Export a balance and read provider state",
+        recipe='''import homelab
+
+status = homelab.get_credit_status()
+homelab.report_credit(
+    "openai",
+    "homelab-monitor",
+    "balance",
+    balance_usd=12.5,
+    daily_burn_usd=1.25,
+)
+''',
+    ),
+    Consumer(
+        slug="credit-watch",
+        name="credit-watch",
+        uses=_uses("notify_joe"),
+        groups=("api-credits",),
+        tags=("api-credits-*",),
+        recipe_title="Alert Joe that a provider is out of credits",
+        recipe='''import homelab
+
+homelab.notify_joe(
+    "xAI is out of credits",
+    "Pirate Radio conversions are paused. Add credits in the xAI console.",
+    tag="api-credits-xai",
+    group="api-credits",
+    buttons=[{"title": "Open billing", "action": "URI", "uri": "https://console.x.ai"}],
+)
+''',
+    ),
 )
 
 
