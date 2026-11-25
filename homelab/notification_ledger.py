@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any
+from typing import Any, Iterator
+
+from .credits import CreditSnapshot, empty_snapshot, snapshot_from_mapping, snapshot_parameters
 
 
 def utc_now() -> str:
@@ -60,8 +63,113 @@ class NotificationLedger:
                     notification_id INTEGER,
                     event_json TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                );
                 """
             )
+            self._apply_migrations(connection)
+
+    def load_credit_snapshot(self, connection: sqlite3.Connection, provider: str) -> CreditSnapshot:
+        row = connection.execute(
+            "SELECT * FROM credit_provider_state WHERE provider = ?",
+            (provider,),
+        ).fetchone()
+        if row is None:
+            return empty_snapshot(provider)
+        return snapshot_from_mapping(row)
+
+    def save_credit_snapshot(self, connection: sqlite3.Connection, snapshot: CreditSnapshot) -> None:
+        connection.execute(
+            """
+            INSERT INTO credit_provider_state (
+                provider, state, balance_usd, daily_burn_usd, services_json, error_count,
+                last_transition_at, last_push_at, last_push_kind, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider) DO UPDATE SET
+                state = excluded.state,
+                balance_usd = excluded.balance_usd,
+                daily_burn_usd = excluded.daily_burn_usd,
+                services_json = excluded.services_json,
+                error_count = excluded.error_count,
+                last_transition_at = excluded.last_transition_at,
+                last_push_at = excluded.last_push_at,
+                last_push_kind = excluded.last_push_kind,
+                updated_at = excluded.updated_at
+            """,
+            snapshot_parameters(snapshot),
+        )
+
+    def list_credit_snapshots(self) -> list[CreditSnapshot]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM credit_provider_state").fetchall()
+        return [snapshot_from_mapping(row) for row in rows]
+
+    def mark_credit_push(self, provider: str, push_kind: str, pushed_at: str) -> None:
+        with self.immediate() as connection:
+            connection.execute(
+                """
+                UPDATE credit_provider_state
+                SET last_push_at = ?,
+                    last_push_kind = ?,
+                    updated_at = ?
+                WHERE provider = ?
+                """,
+                (pushed_at, push_kind, pushed_at, provider),
+            )
+
+    @contextmanager
+    def immediate(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path)
+        connection.row_factory = sqlite3.Row
+        connection.isolation_level = None
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.execute("COMMIT")
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            connection.close()
+
+    def _apply_migrations(self, connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            applied = connection.execute(
+                "SELECT version FROM schema_migrations WHERE version = 1"
+            ).fetchone()
+            if applied is None:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS credit_provider_state (
+                        provider TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        balance_usd REAL,
+                        daily_burn_usd REAL,
+                        services_json TEXT NOT NULL,
+                        error_count INTEGER NOT NULL,
+                        last_transition_at TEXT,
+                        last_push_at TEXT,
+                        last_push_kind TEXT,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)",
+                    (utc_now(),),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
     def record_sent(
         self,
