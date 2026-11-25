@@ -115,10 +115,12 @@ class NotificationLedger:
                 UPDATE credit_provider_state
                 SET last_push_at = ?,
                     last_push_kind = ?,
+                    services_json = CASE WHEN ? = 'recovered' THEN '[]' ELSE services_json END,
+                    error_count = CASE WHEN ? = 'recovered' THEN 0 ELSE error_count END,
                     updated_at = ?
                 WHERE provider = ?
                 """,
-                (pushed_at, push_kind, pushed_at, provider),
+                (pushed_at, push_kind, push_kind, push_kind, pushed_at, provider),
             )
 
     @contextmanager

@@ -542,7 +542,7 @@ def report_credit(
     token: str | None = None,
     timeout: float = 10,
 ) -> dict[str, Any]:
-    """Report a provider credit observation. This does not buy credits."""
+    """Report a provider credit observation."""
 
     return HomelabFunctionsClient(service_url, token, timeout).report_credit(
         provider,

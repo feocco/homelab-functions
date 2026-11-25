@@ -1,10 +1,4 @@
-"""Provider credit state.
-
-The classifier and the reducer are pure. Callers parse HTTP or an upstream
-error into a `CreditReport`, then apply `reduce_credit_state`. Nothing in
-this module buys credits or calls a billing endpoint. The billing URL is
-only the label on the notification button.
-"""
+"""Callers parse a report into a `CreditReport`, then apply `reduce_credit_state`."""
 
 from __future__ import annotations
 
@@ -23,9 +17,9 @@ REMINDER_AFTER = timedelta(hours=24)
 PROVIDER_IDS = ("xai", "x", "openai", "cursor")
 SERVICE_ORDER = ("pirate-radio", "pebble", "home-assistant")
 SERVICE_PHRASES = {
-    "pirate-radio": "Pirate Radio conversions",
-    "pebble": "Pebble voice notes",
-    "home-assistant": "Home Assistant Grok voice",
+    "pirate-radio": ("Pirate Radio conversions", True),
+    "pebble": ("Pebble voice notes", True),
+    "home-assistant": ("Home Assistant Grok voice", False),
 }
 
 _XAI_BODY = re.compile(
@@ -168,8 +162,6 @@ def empty_snapshot(provider: str) -> CreditSnapshot:
 
 
 def is_credit_error(provider: str, status: int | None, body: str | None) -> bool:
-    """Return whether this upstream error is a credit outage for that provider."""
-
     text = (body or "")[:BODY_LIMIT]
     for rule in _RULES:
         if rule.provider != provider:
@@ -191,8 +183,6 @@ def low_line_usd(provider: str, daily_burn_usd: float | None) -> float:
 
 
 def parse_credit_report(payload: Any, *, now: datetime | None = None) -> CreditReport:
-    """Parse one report body. The body is truncated to 500 characters."""
-
     if not isinstance(payload, dict):
         raise CreditInputError("Request body must be a JSON object")
     allowed = {
@@ -232,8 +222,6 @@ def parse_credit_report(payload: Any, *, now: datetime | None = None) -> CreditR
 
 
 def reduce_credit_state(previous: CreditSnapshot, report: CreditReport) -> CreditReduction:
-    """Apply one report to one provider snapshot."""
-
     credit_error = report.kind == "error" and is_credit_error(
         report.provider,
         report.status,
@@ -269,9 +257,6 @@ def reduce_credit_state(previous: CreditSnapshot, report: CreditReport) -> Credi
 
     push_services = services
     push_count = error_count
-    if new_state == "ok" and previous.state in {"low", "out"}:
-        services = ()
-        error_count = 0
     when = format_timestamp(report.observed_at)
     transition_at = when if new_state != previous.state else previous.last_transition_at
     changed = (
@@ -324,16 +309,18 @@ def reduce_credit_state(previous: CreditSnapshot, report: CreditReport) -> Credi
 
 def render_push(kind: str, snapshot: CreditSnapshot) -> CreditPush:
     spec = PROVIDER_BY_ID[snapshot.provider]
-    phrases = [SERVICE_PHRASES.get(service, service) for service in snapshot.services]
+    described = [_phrase(service) for service in snapshot.services]
+    phrases = [text for text, _plural in described]
+    plurals = [plural for _text, plural in described]
     if kind == "out":
         title = f"{spec.display_name} is out of credits"
-        message = _out_message(spec, snapshot, phrases, reminder=False)
+        message = _out_message(spec, snapshot, phrases, plurals, reminder=False)
     elif kind == "reminder":
         title = f"{spec.display_name} is still out of credits"
-        message = _out_message(spec, snapshot, phrases, reminder=True)
+        message = _out_message(spec, snapshot, phrases, plurals, reminder=True)
     elif kind == "low":
         title = f"{spec.display_name} credits running low"
-        message = _low_message(snapshot, phrases)
+        message = _low_message(snapshot, phrases, plurals)
     elif kind == "recovered":
         title = f"{spec.display_name} credits are back"
         message = _recovered_message(snapshot, phrases)
@@ -401,8 +388,8 @@ def reduction_payload(
         "pushed": pushed,
         "push_kind": reduction.push_kind,
         "notification_id": notification_id,
-        "error_count": reduction.snapshot.error_count,
-        "services": list(reduction.snapshot.services),
+        "error_count": 0 if pushed and reduction.push_kind == "recovered" else reduction.snapshot.error_count,
+        "services": [] if pushed and reduction.push_kind == "recovered" else list(reduction.snapshot.services),
     }
 
 
@@ -507,42 +494,49 @@ def _push_kind(previous: CreditSnapshot, new_state: str, observed_at: datetime) 
     return None
 
 
+def _phrase(service: str) -> tuple[str, bool]:
+    return SERVICE_PHRASES.get(service, (service, True))
+
+
 def _out_message(
     spec: ProviderSpec,
     snapshot: CreditSnapshot,
     phrases: list[str],
+    plurals: list[bool],
     *,
     reminder: bool,
 ) -> str:
     parts: list[str] = []
     if snapshot.balance_usd is not None:
         parts.append(f"Balance {money(snapshot.balance_usd)}. ")
-    parts.append(_out_impact(phrases))
+    parts.append(_out_impact(phrases, plurals))
     if reminder and snapshot.error_count > 1:
         parts.append(f"{snapshot.error_count} credit errors since it ran out. ")
     parts.append(spec.closing)
     return "".join(parts)
 
 
-def _out_impact(phrases: list[str]) -> str:
+def _out_impact(phrases: list[str], plurals: list[bool]) -> str:
     if not phrases:
         return ""
+    verb = "are" if plurals[0] else "is"
     if len(phrases) == 1:
-        return f"{phrases[0]} are paused. "
+        return f"{phrases[0]} {verb} paused. "
     rest = " and ".join(phrases[1:])
-    return f"{phrases[0]} are paused, and {rest} will fail. "
+    return f"{phrases[0]} {verb} paused, and {rest} will fail. "
 
 
-def _low_message(snapshot: CreditSnapshot, phrases: list[str]) -> str:
+def _low_message(snapshot: CreditSnapshot, phrases: list[str], plurals: list[bool]) -> str:
     balance = 0.0 if snapshot.balance_usd is None else snapshot.balance_usd
     joined = _join_phrases(phrases)
+    verb = "pause" if len(phrases) != 1 or plurals[0] else "pauses"
     if snapshot.daily_burn_usd is not None and snapshot.daily_burn_usd > 0 and snapshot.balance_usd is not None:
         return (
             f"{money(balance)} left, {_pace(balance, snapshot.daily_burn_usd)} "
             f"at your recent use ({money(snapshot.daily_burn_usd)}/day). "
-            f"At $0, {joined} pause."
+            f"At $0, {joined} {verb}."
         )
-    return f"{money(balance)} left. At $0, {joined} pause."
+    return f"{money(balance)} left. At $0, {joined} {verb}."
 
 
 def _recovered_message(snapshot: CreditSnapshot, phrases: list[str]) -> str:

@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import json
 import sqlite3
 import unittest
@@ -226,6 +227,11 @@ class CreditHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered_body["push_kind"], "recovered")
         self.assertEqual(self.push(2)["title"], "xAI credits are back")
         self.assertEqual(self.push(2)["message"], XAI_RECOVERED)
+        self.assertEqual(recovered_body["services"], [])
+        self.assertEqual(recovered_body["error_count"], 0)
+        provider = (await (await self.status()).json())["providers"][0]
+        self.assertEqual(provider["services"], [])
+        self.assertEqual(provider["error_count"], 0)
 
     async def test_reminder_names_every_service_seen_while_out(self):
         first = await self.report(
@@ -418,6 +424,52 @@ class CreditHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.fake.calls), 1)
         self.assertEqual(self.push()["message"], XAI_OUT_UNKNOWN)
 
+    async def test_failed_recovery_notify_retries_the_same_message(self):
+        await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "error",
+                "status": 403,
+                "body": "used all available credits",
+                "observed_at": T0,
+            }
+        )
+        await self.client.close()
+        self.fake = FakeHomeAssistant(fail_first=True)
+        self.client = TestClient(
+            TestServer(create_app(write_config(Path(self.tmp.name)), ha_client=self.fake))
+        )
+        await self.client.start_server()
+        failed = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "success",
+                "observed_at": T1,
+            }
+        )
+        self.assertEqual(failed.status, 502)
+        self.assertEqual(self.fake.calls, [])
+        retried = await self.report(
+            {
+                "provider": "xai",
+                "service": "pirate-radio",
+                "kind": "success",
+                "observed_at": T2,
+            }
+        )
+        self.assertEqual(retried.status, 200)
+        retried_body = await retried.json()
+        self.assertTrue(retried_body["pushed"])
+        self.assertEqual(retried_body["services"], [])
+        self.assertEqual(self.push()["title"], "xAI credits are back")
+        self.assertEqual(self.push()["message"], "Pirate Radio conversions resumed.")
+        provider = (await (await self.status()).json())["providers"][0]
+        self.assertEqual(provider["state"], "ok")
+        self.assertEqual(provider["services"], [])
+        self.assertEqual(provider["error_count"], 0)
+
     async def test_notify_timeout_is_retried_once(self):
         await self.client.close()
         self.fake = FakeHomeAssistant(timeout_first=True)
@@ -489,6 +541,49 @@ class CreditHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await recovered.json())["state"], "ok")
         self.assertEqual(self.push(1)["title"], "OpenAI credits are back")
         self.assertEqual(self.push(1)["message"], "Balance $20.00. openai-proxy resumed.")
+
+    async def test_overlapping_reports_push_once(self):
+        await self.client.close()
+        self.fake = HoldingHomeAssistant()
+        self.client = TestClient(
+            TestServer(create_app(write_config(Path(self.tmp.name)), ha_client=self.fake))
+        )
+        await self.client.start_server()
+        payload = {
+            "provider": "xai",
+            "service": "pirate-radio",
+            "kind": "error",
+            "status": 403,
+            "body": CREDIT_BODY,
+            "observed_at": T0,
+        }
+        first = asyncio.create_task(self.report(payload))
+        await self.fake.started.wait()
+        second = asyncio.create_task(self.report(payload))
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.fake.entered, 1)
+        self.fake.release.set()
+        first_response, second_response = await asyncio.gather(first, second)
+        self.assertEqual(first_response.status, 200)
+        self.assertEqual(second_response.status, 200)
+        bodies = [await first_response.json(), await second_response.json()]
+        self.assertEqual([body["pushed"] for body in bodies].count(True), 1)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.fake.calls[0]["service_data"]["title"], "xAI is out of credits")
+
+
+class HoldingHomeAssistant(FakeHomeAssistant):
+    def __init__(self):
+        super().__init__()
+        self.entered = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_notification(self, service_data, *, notify_service):
+        self.entered += 1
+        self.started.set()
+        await self.release.wait()
+        return await super().send_notification(service_data, notify_service=notify_service)
 
 
 class ClassifierTests(unittest.TestCase):
@@ -599,6 +694,64 @@ class ClassifierTests(unittest.TestCase):
         )
         self.assertEqual(three.message, XAI_OUT)
         self.assertEqual(len(three.buttons), 1)
+
+    def test_a_single_singular_service_uses_is_and_pauses(self):
+        out = render_push(
+            "out",
+            replace(
+                CreditSnapshot(
+                    provider="xai",
+                    state="out",
+                    balance_usd=None,
+                    daily_burn_usd=None,
+                    services=("home-assistant",),
+                    error_count=1,
+                    last_transition_at=None,
+                    last_push_at=None,
+                    last_push_kind=None,
+                    updated_at=None,
+                )
+            ),
+        )
+        self.assertEqual(
+            out.message,
+            "Home Assistant Grok voice is paused. Add credits in the xAI console; "
+            "I'll tell you when it's working again.",
+        )
+        low = render_push(
+            "low",
+            replace(
+                CreditSnapshot(
+                    provider="xai",
+                    state="low",
+                    balance_usd=3.4,
+                    daily_burn_usd=None,
+                    services=("home-assistant",),
+                    error_count=0,
+                    last_transition_at=None,
+                    last_push_at=None,
+                    last_push_kind=None,
+                    updated_at=None,
+                )
+            ),
+        )
+        self.assertEqual(low.message, "$3.40 left. At $0, Home Assistant Grok voice pauses.")
+        mixed = render_push(
+            "out",
+            CreditSnapshot(
+                provider="xai",
+                state="out",
+                balance_usd=None,
+                daily_burn_usd=None,
+                services=("home-assistant", "homelab-monitor"),
+                error_count=1,
+                last_transition_at=None,
+                last_push_at=None,
+                last_push_kind=None,
+                updated_at=None,
+            ),
+        )
+        self.assertIn("Home Assistant Grok voice is paused, and homelab-monitor will fail.", mixed.message)
 
 
 class MigrationTests(unittest.TestCase):
@@ -785,3 +938,19 @@ class PebbleCreditHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again.status, 502)
         self.assertEqual(len(self.fake.calls), 1)
         self.assertEqual(self.forwarder_calls, [])
+
+    async def test_successful_transcription_clears_the_outage(self):
+        self.responses.append((403, CREDIT_BODY))
+        failed = await self.post_audio("outage")
+        self.assertEqual(failed.status, 502)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.responses.append((200, json.dumps({"text": "lights on", "duration": 1.2})))
+        recovered = await self.post_audio("recovered")
+        recovered_body = await recovered.json()
+        self.assertEqual(recovered.status, 200)
+        self.assertEqual(recovered_body["status"], "forwarded")
+        self.assertEqual(len(self.forwarder_calls), 1)
+        self.assertEqual(self.forwarder_calls[0]["transcript"], "lights on")
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(self.fake.calls[1]["service_data"]["title"], "xAI credits are back")
+        self.assertEqual(self.fake.calls[1]["service_data"]["message"], "Pebble voice notes resumed.")

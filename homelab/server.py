@@ -517,6 +517,7 @@ LEDGER_KEY = web.AppKey("notification_ledger", NotificationLedger)
 ACTION_RECORDER_KEY = web.AppKey("notification_action_recorder", NotificationActionRecorder)
 ACTION_RECORDER_TASK_KEY = web.AppKey("notification_action_recorder_task", asyncio.Task[None])
 PEBBLE_STATE_KEY = web.AppKey("pebble_state", dict)
+CREDIT_LOCKS_KEY = web.AppKey("credit_locks", dict)
 PEBBLE_FORWARDER_KEY = web.AppKey("pebble_forwarder", object)
 PEBBLE_TRANSCRIBER_KEY = web.AppKey("pebble_transcriber", object)
 
@@ -610,6 +611,7 @@ def create_app(
         app.on_startup.append(start_action_recorder)
         app.on_cleanup.append(stop_action_recorder)
     app[PEBBLE_STATE_KEY] = {"ledger": None}
+    app[CREDIT_LOCKS_KEY] = {}
     if pebble_forwarder is not None:
         app[PEBBLE_FORWARDER_KEY] = pebble_forwarder
     if pebble_transcriber is not None:
@@ -656,12 +658,16 @@ async def relay_pebble(request: web.Request) -> web.Response:
     config = request.app[CONFIG_KEY]
     try:
         limited_request = request.clone(client_max_size=MAX_PEBBLE_BODY_BYTES)
+        async def on_transcript() -> None:
+            await _report_pebble_stt_success(request)
+
         result = await relay_event(
             limited_request,
             settings=PebbleSettings.from_config(config),
             ledger=_pebble_ledger(request),
             forwarder=request.app.get(PEBBLE_FORWARDER_KEY) or _default_pebble_forwarder(config),
             transcriber=request.app.get(PEBBLE_TRANSCRIBER_KEY),
+            on_transcript=on_transcript,
         )
     except web.HTTPRequestEntityTooLarge:
         return error_response(
@@ -955,6 +961,19 @@ async def get_credit_status(request: web.Request) -> web.Response:
 
 
 async def deliver_credit_report(app: web.Application, report) -> dict[str, Any]:
+    # The notify call writes the same ledger, so it cannot sit inside the
+    # state transaction. This lock stops a second report from alerting
+    # before the first report records that it pushed.
+    locks = app[CREDIT_LOCKS_KEY]
+    lock = locks.get(report.provider)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[report.provider] = lock
+    async with lock:
+        return await _deliver_credit_report(app, report)
+
+
+async def _deliver_credit_report(app: web.Application, report) -> dict[str, Any]:
     ledger = app[LEDGER_KEY]
     with ledger.immediate() as connection:
         previous = ledger.load_credit_snapshot(connection, report.provider)
@@ -1000,6 +1019,20 @@ async def _send_credit_push(app: web.Application, push: CreditPush) -> int:
         ha_context_id=context_id,
     )
     return int(record["id"])
+
+
+async def _report_pebble_stt_success(request: web.Request) -> None:
+    try:
+        report = parse_credit_report(
+            {
+                "provider": "xai",
+                "service": "pebble",
+                "kind": "success",
+            }
+        )
+        await deliver_credit_report(request.app, report)
+    except Exception:
+        LOGGER.warning("pebble credit success report failed")
 
 
 async def _report_pebble_stt_failure(request: web.Request, exc: PebbleRequestError) -> None:

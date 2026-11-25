@@ -623,6 +623,7 @@ async def relay_event(
     ledger: PebbleLedger,
     forwarder: Any,
     transcriber: Any | None,
+    on_transcript: Any | None = None,
 ) -> dict[str, Any]:
     if not settings.ring_token:
         raise PebbleRequestError(
@@ -688,6 +689,8 @@ async def relay_event(
             transcribed = await active.transcribe(audio or b"", filename=filename, content_type=content_type)
             transcript_text = transcribed.text
             duration = transcribed.duration_seconds
+            if on_transcript is not None:
+                await on_transcript()
         payload = _forward_payload(event, transcript_text or "", duration, fields)
         await forwarder.post_json(webhook_url, webhook_key, payload)
     except Exception:
