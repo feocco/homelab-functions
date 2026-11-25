@@ -670,6 +670,14 @@ async def relay_pebble(request: web.Request) -> web.Response:
             "Pebble request body is too large",
         )
     except PebbleRequestError as exc:
+        if exc.upstream_status is not None or exc.upstream_body is not None:
+            try:
+                await _report_pebble_stt_failure(request, exc)
+            except Exception:
+                LOGGER.warning(
+                    "pebble credit report failed status=%s",
+                    exc.upstream_status,
+                )
         LOGGER.warning("pebble relay rejected code=%s", exc.code)
         return error_response(exc.status, exc.code, str(exc), detail=exc.detail)
     return web.json_response(result)
@@ -992,6 +1000,20 @@ async def _send_credit_push(app: web.Application, push: CreditPush) -> int:
         ha_context_id=context_id,
     )
     return int(record["id"])
+
+
+async def _report_pebble_stt_failure(request: web.Request, exc: PebbleRequestError) -> None:
+    payload: dict[str, Any] = {
+        "provider": "xai",
+        "service": "pebble",
+        "kind": "error",
+    }
+    if exc.upstream_status is not None:
+        payload["status"] = exc.upstream_status
+    if exc.upstream_body is not None:
+        payload["body"] = exc.upstream_body
+    report = parse_credit_report(payload)
+    await deliver_credit_report(request.app, report)
 
 
 def parse_limit(raw_limit: str | None, *, default: int) -> int:

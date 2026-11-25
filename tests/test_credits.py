@@ -3,9 +3,11 @@ import json
 import sqlite3
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from homelab.credits import (
@@ -16,6 +18,7 @@ from homelab.credits import (
     render_push,
 )
 from homelab.notification_ledger import NotificationLedger
+from homelab.pebble import XaiSpeechTranscriber
 from homelab.server import Config, HomeAssistantError, create_app
 
 
@@ -699,3 +702,86 @@ class BillingBoundaryTests(unittest.TestCase):
         self.assertNotIn("purchase", source.lower())
         self.assertNotIn("checkout", source.lower())
         self.assertIn("https://console.x.ai", source)
+
+
+class PebbleCreditHookTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = TemporaryDirectory()
+        self.fake = FakeHomeAssistant()
+        self.responses = []
+        self.stub = web.Application()
+        self.stub.router.add_post("/stt", self._stt)
+        self.stub_server = TestServer(self.stub)
+        await self.stub_server.start_server()
+        transcriber = XaiSpeechTranscriber(
+            "xai-test-key",
+            "grok-voice-transcribe-2.0",
+            5,
+            url=str(self.stub_server.make_url("/stt")),
+        )
+        self.forwarder_calls = []
+
+        class Forwarder:
+            async def post_json(inner_self, url, key, payload):
+                self.forwarder_calls.append(payload)
+
+        self.client = TestClient(
+            TestServer(
+                create_app(
+                    write_config(Path(self.tmp.name)),
+                    ha_client=self.fake,
+                    pebble_forwarder=Forwarder(),
+                    pebble_transcriber=transcriber,
+                )
+            )
+        )
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        await self.stub_server.close()
+        self.tmp.cleanup()
+
+    async def _stt(self, request):
+        await request.read()
+        status, text = self.responses.pop(0)
+        return web.Response(status=status, text=text, content_type="text/plain")
+
+    async def post_audio(self, delivery):
+        form = FormData()
+        form.add_field("recordedAt", str(int(datetime.now(timezone.utc).timestamp() * 1000)))
+        form.add_field("client", "ring")
+        form.add_field("audio", b"AUDIO-SENTINEL", filename="clip.m4a", content_type="audio/mp4")
+        return await self.client.post(
+            "/v1/pebble",
+            data=form,
+            headers={
+                "Authorization": "Bearer pebble-ring-token",
+                "X-Index-Trigger": "single-click-hold",
+                "X-Index-Delivery": delivery,
+            },
+        )
+
+    async def test_stt_credit_error_pushes_once_and_hides_the_body(self):
+        self.responses.append((403, "Forbidden"))
+        generic = await self.post_audio("generic")
+        generic_body = await generic.json()
+        self.assertEqual(generic.status, 502)
+        self.assertEqual(generic_body["error"]["code"], "transcription_failed")
+        self.assertNotIn("Forbidden", json.dumps(generic_body))
+        self.assertEqual(self.fake.calls, [])
+
+        self.responses.append((403, CREDIT_BODY))
+        credit = await self.post_audio("credit")
+        credit_body = await credit.json()
+        self.assertEqual(credit.status, 502)
+        self.assertNotIn("used all available credits", json.dumps(credit_body))
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertIn("Pebble voice notes are paused.", self.fake.calls[0]["service_data"]["message"])
+        self.assertNotIn("Balance", self.fake.calls[0]["service_data"]["message"])
+
+        self.responses.append((429, CREDIT_BODY))
+        again = await self.post_audio("credit-again")
+        self.assertEqual(again.status, 502)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.forwarder_calls, [])
